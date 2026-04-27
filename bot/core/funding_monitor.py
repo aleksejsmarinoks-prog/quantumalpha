@@ -350,15 +350,18 @@ class FundingMonitor:
                 pass  # Already have this settlement
 
     async def _maybe_emit_opportunity(self, fr: FundingRate):
-        """Check if rate crosses thresholds → store + (optionally) callback."""
+        """
+        Check if rate crosses thresholds → store + (optionally) callback.
+
+        Bybit funding mechanics:
+        - POSITIVE rate → longs PAY shorts (so SHORTS receive the funding)
+        - NEGATIVE rate → shorts PAY longs (so LONGS receive the funding)
+        """
         rate = fr.funding_rate
-        severity = None
-        direction = None
+        severity: Optional[str] = None
+        direction: Optional[str] = None
 
         if rate >= SIGNAL_EXTREME:
-            severity, direction = "EXTREME", "LONG_GETS_PAID"
-            # Wait — extreme positive funding means longs PAY shorts.
-            # So shorts get paid. Let me fix:
             severity, direction = "EXTREME", "SHORT_GETS_PAID"
         elif rate <= -SIGNAL_EXTREME:
             severity, direction = "EXTREME", "LONG_GETS_PAID"

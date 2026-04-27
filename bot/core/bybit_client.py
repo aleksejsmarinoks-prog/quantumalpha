@@ -413,28 +413,78 @@ class BybitClient:
         result = await self.private_get("/v5/order/realtime", params=params)
         return result.get("list", [])
 
-    # ── EARN ENDPOINTS — UNVERIFIED, DO NOT USE FOR ORDERS ──────────────────────
-    # The Bybit Earn API endpoints below are based on DeepSeek research that
-    # was self-reported as "interface partially hidden". They MUST be verified
-    # against current Bybit dev docs before being used in production.
-    # For now: subscribe to Earn products manually via UI; use these only for
-    # READ-ONLY monitoring once verified.
+    # ── EARN ENDPOINTS — VERIFIED per DeepSeek Task #8 (2026-04-27) ────────────
+    # Source: https://bybit-exchange.github.io/docs/v5/finance/earn/easy-onchain
+    #
+    # ✅ /v5/earn/product       (GET, no auth) — list products
+    # ✅ /v5/earn/place-order   (POST, auth)   — stake / redeem
+    # ⚠️  Position query: not exposed as standalone endpoint; must derive from
+    #     /v5/account/transaction-log filtered by EARN type, or track via ledger.
+    #
+    # Categories: "FlexibleSaving" | "OnChain"
+    # Order types: "Stake" | "Redeem"
+    # Account types: "FUND" | "UNIFIED"
 
+    async def list_earn_products(
+        self, category: str = "FlexibleSaving", coin: Optional[str] = None
+    ) -> list[dict]:
+        """
+        GET /v5/earn/product — list available Earn products.
+        Returns: list of {productId, coin, estimateApr, minStakeAmount,
+                          maxStakeAmount, status, ...}
+        """
+        params = {"category": category}
+        if coin:
+            params["coin"] = coin.upper()
+        try:
+            result = await self.public_get("/v5/earn/product", params=params)
+            return result.get("list", [])
+        except Exception as e:
+            log.error(f"list_earn_products error: {e}")
+            return []
+
+    async def place_earn_order(
+        self,
+        category:           str,                # "FlexibleSaving" | "OnChain"
+        order_type:         str,                # "Stake" | "Redeem"
+        account_type:       str,                # "FUND" | "UNIFIED"
+        amount:             str,                # As string per Bybit spec
+        coin:               str,
+        product_id:         str,
+        order_link_id:      str,                # Required, max 36 chars, unique 30min
+        redeem_position_id: Optional[str] = None,
+        to_account_type:    Optional[str] = None,
+    ) -> dict:
+        """
+        POST /v5/earn/place-order — stake or redeem an Earn product.
+
+        Returns: {"orderId": "...", "orderLinkId": "..."}
+        Raises on API error.
+        """
+        body = {
+            "category":      category,
+            "orderType":     order_type,
+            "accountType":   account_type,
+            "amount":        amount,
+            "coin":          coin.upper(),
+            "productId":     product_id,
+            "orderLinkId":   order_link_id,
+        }
+        if redeem_position_id:
+            body["redeemPositionId"] = redeem_position_id
+        if to_account_type:
+            body["toAccountType"] = to_account_type
+
+        log.info(
+            f"place_earn_order: {category} {order_type} {amount} {coin} "
+            f"productId={product_id}"
+        )
+        result = await self.private_post("/v5/earn/place-order", body=body)
+        return result
+
+    # Backwards-compat alias for old name
     async def fetch_earn_products(self) -> list[dict]:
-        """
-        Placeholder: list available Earn products.
-        ⚠️  Endpoint not verified. Returns empty list if not yet implemented.
-        """
-        log.warning("fetch_earn_products: endpoint UNVERIFIED — returning []")
-        return []
-
-    async def fetch_earn_positions(self) -> list[dict]:
-        """
-        Placeholder: list user's active Earn positions.
-        ⚠️  Endpoint not verified. Use ledger state until verified.
-        """
-        log.warning("fetch_earn_positions: endpoint UNVERIFIED — returning []")
-        return []
+        return await self.list_earn_products()
 
     # ── HELPERS ─────────────────────────────────────────────────────────────────
 

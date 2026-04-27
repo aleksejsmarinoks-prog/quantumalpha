@@ -47,29 +47,71 @@ log = logging.getLogger("qa_bot.strategies.funding_arb")
 
 
 # =============================================================================
-# CONFIGURATION (defaults — overridable via env or constructor)
+# CONFIGURATION — calibrated per DeepSeek Task #9 (2026-04-27)
+#
+# DeepSeek baseline (12-month BTC/ETH/SOL data):
+#   BTC: mean +0.0042%/8h, p75 +0.0089%, p95 +0.0215%, % > 0.05% = 4.2%
+#   ETH: mean +0.0058%/8h, p75 +0.0112%, p95 +0.0247%, % > 0.05% = 5.8%
+#   SOL: mean +0.0121%/8h, p75 +0.0189%, p95 +0.0402%, % > 0.05% = 12.7%
+#
+# DeepSeek recommended open=0.028%/8h. We override to 0.040% per pair-default
+# because 0.028% is exactly break-even per their own cost model
+# (Total_Cost ≈ 0.255%, breakeven 3d = 0.028%/8h). Operating at break-even
+# means zero expected edge — all variance is noise. We require 1.5x margin.
+#
+# Per-pair thresholds reflect different liquidity profiles.
 # =============================================================================
 
-# Open threshold: funding rate per 8h above which we enter
-DEFAULT_OPEN_RATE_THRESHOLD  = 0.0005    # 0.05%/8h ≈ 54% APR
+# Conservative defaults (override per-pair below)
+DEFAULT_OPEN_RATE_THRESHOLD  = 0.0004    # 0.040%/8h ≈ 44% APR
+DEFAULT_CLOSE_RATE_THRESHOLD = 0.00015   # 0.015%/8h ≈ 16% APR
 
-# Close threshold: funding rate per 8h below which we exit
-DEFAULT_CLOSE_RATE_THRESHOLD = 0.0001    # 0.01%/8h ≈ 11% APR
+# Per-symbol fine-tuning (override DEFAULT_*)
+PER_SYMBOL_THRESHOLDS = {
+    # ETH: most balanced — open at 1.5x breakeven
+    "ETHUSDT": {"open": 0.00040, "close": 0.00012, "max_basis_pct": 1.5},
+    # SOL: higher rates but wider slippage — needs higher open threshold
+    "SOLUSDT": {"open": 0.00050, "close": 0.00015, "max_basis_pct": 2.0},
+}
 
 # Per-leg position size (in USD). Two legs = 2x this is total exposure.
 DEFAULT_LEG_SIZE_USD         = 200.0
 
-# Min hold period — don't open and immediately close
-MIN_HOLD_HOURS               = 8.0       # 1 funding settlement minimum
+# Min hold period — DeepSeek recommendation: 3 settlements before close eval
+MIN_HOLD_HOURS               = 24.0      # 3 settlements × 8h
 
-# Cost model (Bybit linear perps + spot)
-TAKER_FEE                    = 0.00055   # 0.055% per leg
-SLIPPAGE_NORMAL              = 0.00050   # 0.05% per leg
-TOTAL_ROUND_TRIP_COST_PCT    = 4 * (TAKER_FEE + SLIPPAGE_NORMAL)
-                                          # 4 legs × (fee + slip) = 0.42%
+# Max hold — DeepSeek recommendation: re-evaluate after 14 days
+MAX_HOLD_HOURS               = 14 * 24   # 336h
 
-# Whitelist (BTC excluded per QA v2.3.2 — no Tier-1 close gate compliant data)
+# Cost model (Bybit linear perps + spot, VIP-0)
+# Spot taker = 0.10%, perp taker = 0.055%, slippage estimate
+SPOT_TAKER_FEE               = 0.0010    # 0.10%
+PERP_TAKER_FEE               = 0.00055   # 0.055%
+PERP_MAKER_FEE               = 0.00020   # 0.020% (limit post-only — future use)
+SLIPPAGE_ETH                 = 0.0004    # 0.04% per leg (DeepSeek estimate)
+SLIPPAGE_SOL                 = 0.0008    # 0.08% per leg (wider)
+TAX_PROVISION                = 0.0003    # 0.03% Latvia 20% PIT provision
+
+# Total round-trip cost (4 transactions: open spot + open perp + close spot + close perp)
+# Per DeepSeek breakeven analysis: ~0.255% for ETH, ~0.30% for SOL
+def calc_round_trip_cost(symbol: str, use_maker_perp: bool = False) -> float:
+    """Calculate total round-trip cost as a fraction of leg notional."""
+    perp_fee = PERP_MAKER_FEE if use_maker_perp else PERP_TAKER_FEE
+    if symbol == "ETHUSDT":
+        slip = SLIPPAGE_ETH
+    elif symbol == "SOLUSDT":
+        slip = SLIPPAGE_SOL
+    else:
+        slip = SLIPPAGE_ETH  # default
+    # 2× spot fees + 2× perp fees + 4× slippage + tax provision
+    return (2 * SPOT_TAKER_FEE) + (2 * perp_fee) + (4 * slip) + TAX_PROVISION
+
+# Whitelist (BTC excluded per QA v2.3.2, even though DeepSeek ranks it 3rd)
 ALLOWED_SYMBOLS              = {"ETHUSDT", "SOLUSDT"}
+
+# Risk caps (per DeepSeek Task #9 recommendation)
+MAX_CONCURRENT_ARBS          = 2
+MAX_POSITION_SIZE_PCT        = 0.20      # 20% of equity per arb
 
 
 # =============================================================================
@@ -211,33 +253,54 @@ class FundingArbStrategy:
             reasons.append(f"Symbol {fr.symbol} not in whitelist")
             return False, reasons
 
+        # Concurrent position limit
+        active_count = sum(
+            1 for arb in self._open_arbs.values()
+            if arb.state in (ArbPositionState.OPEN, ArbPositionState.OPENING)
+        )
+        if active_count >= MAX_CONCURRENT_ARBS:
+            reasons.append(f"Max concurrent arbs reached ({active_count}/{MAX_CONCURRENT_ARBS})")
+            return False, reasons
+
         # Already have open arb on this symbol?
         if fr.symbol in self._open_arbs:
             existing = self._open_arbs[fr.symbol]
-            if existing.state in (
-                ArbPositionState.OPEN, ArbPositionState.OPENING
-            ):
+            if existing.state in (ArbPositionState.OPEN, ArbPositionState.OPENING):
                 reasons.append(f"Already have open arb on {fr.symbol}")
                 return False, reasons
 
+        # Per-symbol threshold (or default)
+        symbol_cfg = PER_SYMBOL_THRESHOLDS.get(fr.symbol, {})
+        open_thr = symbol_cfg.get("open", self.open_threshold)
+
         # Threshold check (positive funding only in v1.0)
-        if fr.funding_rate < self.open_threshold:
+        if fr.funding_rate < open_thr:
             reasons.append(
                 f"Funding {fr.funding_rate*100:.4f}%/8h below threshold "
-                f"{self.open_threshold*100:.4f}%/8h"
+                f"{open_thr*100:.4f}%/8h"
             )
             return False, reasons
 
         # Economic check: assume 3-day holding (9 settlements) at current rate.
-        # Cost formula: leg_size × 4 × (fee + slippage) covers all 4 transactions
-        # (open spot + open perp + close spot + close perp)
+        # Per DeepSeek Task #9: round-trip cost is symbol-specific.
         ASSUMED_HOLDING_SETTLEMENTS = 9
-        expected_funding = self.leg_size_usd * fr.funding_rate * ASSUMED_HOLDING_SETTLEMENTS
-        cost_round_trip  = self.leg_size_usd * TOTAL_ROUND_TRIP_COST_PCT
+        round_trip_cost_pct = calc_round_trip_cost(fr.symbol, use_maker_perp=False)
+        expected_funding   = self.leg_size_usd * fr.funding_rate * ASSUMED_HOLDING_SETTLEMENTS
+        cost_round_trip    = self.leg_size_usd * round_trip_cost_pct
         if expected_funding < cost_round_trip * 1.5:    # 1.5x safety margin
             reasons.append(
                 f"Expected 3d funding ${expected_funding:.4f} < "
-                f"1.5x round-trip cost ${cost_round_trip*1.5:.4f}"
+                f"1.5x round-trip cost ${cost_round_trip*1.5:.4f} "
+                f"(cost_pct={round_trip_cost_pct*100:.3f}%)"
+            )
+            return False, reasons
+
+        # Risk cap check: position size must fit within MAX_POSITION_SIZE_PCT of equity
+        max_allowed = current_equity_usd * MAX_POSITION_SIZE_PCT
+        if self.leg_size_usd > max_allowed:
+            reasons.append(
+                f"Leg size ${self.leg_size_usd} exceeds {MAX_POSITION_SIZE_PCT*100:.0f}% "
+                f"of equity (${max_allowed:.2f})"
             )
             return False, reasons
 
@@ -255,19 +318,32 @@ class FundingArbStrategy:
             return False, [f"Not open (state={arb.state.value})"]
 
         # Min hold check
+        hours_open = 0.0
         if arb.opened_at_utc:
             opened_ts = datetime.fromisoformat(
                 arb.opened_at_utc.replace("Z", "+00:00")
             ).timestamp()
             hours_open = (datetime.now(timezone.utc).timestamp() - opened_ts) / 3600
-            if hours_open < MIN_HOLD_HOURS:
-                return False, [f"Min hold {MIN_HOLD_HOURS}h not met ({hours_open:.1f}h)"]
+
+        if hours_open < MIN_HOLD_HOURS:
+            return False, [f"Min hold {MIN_HOLD_HOURS}h not met ({hours_open:.1f}h)"]
+
+        # Max hold reached — force close to re-evaluate
+        if hours_open > MAX_HOLD_HOURS:
+            reasons.append(
+                f"Max hold {MAX_HOLD_HOURS}h exceeded ({hours_open:.1f}h) — force close"
+            )
+            return True, reasons
+
+        # Per-symbol close threshold
+        symbol_cfg = PER_SYMBOL_THRESHOLDS.get(arb.symbol_perp, {})
+        close_thr = symbol_cfg.get("close", self.close_threshold)
 
         # Funding rate dropped below close threshold
-        if current_funding_rate <= self.close_threshold:
+        if current_funding_rate <= close_thr:
             reasons.append(
                 f"Funding {current_funding_rate*100:.4f}%/8h below close threshold "
-                f"{self.close_threshold*100:.4f}%/8h"
+                f"{close_thr*100:.4f}%/8h"
             )
             return True, reasons
 
@@ -276,7 +352,10 @@ class FundingArbStrategy:
             reasons.append("Funding flipped negative — must close")
             return True, reasons
 
-        return False, [f"Funding still healthy at {current_funding_rate*100:+.4f}%/8h"]
+        return False, [
+            f"Funding still healthy at {current_funding_rate*100:+.4f}%/8h "
+            f"(close_thr={close_thr*100:.4f}%/8h, hours_open={hours_open:.1f})"
+        ]
 
     # ── EXECUTION (paper mode by default) ───────────────────────────────────────
 
@@ -343,8 +422,8 @@ class FundingArbStrategy:
         )
 
         # Record both legs to ledger
-        spot_fee = approved_size * TAKER_FEE
-        perp_fee = approved_size * TAKER_FEE
+        spot_fee = approved_size * SPOT_TAKER_FEE
+        perp_fee = approved_size * PERP_TAKER_FEE
 
         self.ledger.record_fill(TradeFill(
             fill_time_utc=arb.opened_at_utc,
@@ -415,8 +494,8 @@ class FundingArbStrategy:
         # Spot exit notional + fees
         spot_exit_notional = arb.spot_quantity * spot_ticker.last_price
         perp_exit_notional = arb.perp_quantity * perp_ticker.last_price
-        spot_close_fee     = spot_exit_notional * TAKER_FEE
-        perp_close_fee     = perp_exit_notional * TAKER_FEE
+        spot_close_fee     = spot_exit_notional * SPOT_TAKER_FEE
+        perp_close_fee     = perp_exit_notional * PERP_TAKER_FEE
 
         self.ledger.record_fill(TradeFill(
             fill_time_utc=arb.closed_at_utc,

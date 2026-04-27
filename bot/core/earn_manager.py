@@ -1,36 +1,38 @@
 """
-core/earn_manager.py — QuantumAlpha Earn Manager v1.0
+core/earn_manager.py — QuantumAlpha Earn Manager v1.1
 
-Read-only Bybit Earn position tracker.
+Bybit Earn position tracker with optional auto-subscription mode.
 
-Why read-only:
-  Bybit V5 Earn API endpoints are not officially verified (DeepSeek Task #4
-  flagged "interface partially hidden"). Using unverified endpoints with real
-  capital is unacceptable risk.
+Modes:
+  - READ_ONLY (default): user subscribes manually via Bybit UI,
+    records to bot via /earn_add command. Safe.
+  - AUTO (LIVE_EARN_MODE=true): bot can subscribe via verified
+    /v5/earn/place-order endpoint (DeepSeek Task #8 verified).
+    Requires API key with Earn permission.
 
-What this does:
-  - User subscribes to Earn products MANUALLY via Bybit UI
-  - Reports those subscriptions to bot via /earn_add command
-  - This module tracks them in PnL ledger, computes APR, blended yield,
-    days to maturity, alerts on expiring lockups
-  - Periodically syncs interest received from PnL ledger
+Live mode covers (per DeepSeek Task #8 verification):
+  ✅ Flexible Savings (USDT, USDC, etc.) — full subscribe/redeem
+  ✅ On-Chain Earn / Staking — full subscribe/redeem
+  ⚠️ Fixed-Term — same FlexibleSaving API, but no early redeem
+  ❌ Liquidity Mining — read-only via API (no place-order endpoint)
+  ❌ Dual Asset / Discount Buy / Launchpool — manual UI required
 
-What this does NOT do (yet, until Task #8 verifies endpoints):
-  - Auto-subscribe to Earn products
-  - Auto-redeem on maturity
-  - Discovery of new Launchpool campaigns
-
-Once endpoints are verified, drop-in upgrade to auto-mode.
+Capital safety: live mode requires explicit env flag AND per-call confirmation
+in Telegram before any subscribe action (no fully autonomous capital deployment).
 """
 
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 from .pnl_ledger import PnLLedger, EarnPosition
+
+if TYPE_CHECKING:
+    from .bybit_client import BybitClient
 
 log = logging.getLogger("qa_bot.earn_manager")
 
@@ -138,21 +140,64 @@ DEFAULT_ALLOCATION_25K = [
 
 class EarnManager:
     """
-    Manual-subscription Earn tracker. Reads from PnL ledger.
+    Manual or auto-subscription Earn tracker. Reads from PnL ledger.
 
-    User flow:
+    User flow (read-only mode):
       1. Subscribe on Bybit UI manually
       2. /earn_add USDT 500 flexible_savings 0.12  (in Telegram)
       3. EarnManager records to ledger
       4. Periodically: /earn_status returns blended APR, interest earned, etc
-      5. On Bybit, interest paid daily; user records via /earn_interest
-         OR (future) auto-sync via verified API
 
-    No real money moves through this module. All commands are bookkeeping.
+    User flow (auto mode, requires LIVE_EARN_MODE=true):
+      1. Bot lists products via /v5/earn/product
+      2. User authorises subscribe via /earn_subscribe Telegram command
+      3. Bot calls /v5/earn/place-order with HMAC-signed request
+      4. Records to ledger automatically
+
+    Per DeepSeek Task #8: only FlexibleSaving and OnChain categories
+    have working place-order API. Fixed-term, Dual Asset, Discount Buy,
+    Launchpool require manual UI subscription.
     """
 
-    def __init__(self, ledger: PnLLedger):
-        self.ledger = ledger
+    # Bybit API category strings (per DeepSeek Task #8)
+    BYBIT_CATEGORY_FLEXIBLE = "FlexibleSaving"
+    BYBIT_CATEGORY_ONCHAIN  = "OnChain"
+
+    # Internal product types (used in our DB) → Bybit categories
+    AUTOMATABLE_PRODUCTS = {
+        "flexible_savings":  BYBIT_CATEGORY_FLEXIBLE,
+        "onchain_staking":   BYBIT_CATEGORY_ONCHAIN,
+    }
+    # These require manual UI subscription:
+    MANUAL_ONLY_PRODUCTS = {
+        "fixed_term",        # Same API but Bybit doesn't separate it cleanly
+        "dual_asset",
+        "discount_buy",
+        "launchpool",
+        "reserve",
+    }
+
+    def __init__(
+        self,
+        ledger:        PnLLedger,
+        bybit_client:  Optional["BybitClient"] = None,
+        live_mode:     bool = False,
+    ):
+        self.ledger        = ledger
+        self.bybit_client  = bybit_client
+        self.live_mode     = live_mode and (bybit_client is not None)
+
+        if live_mode and bybit_client is None:
+            log.warning(
+                "EarnManager: live_mode requested but no bybit_client provided. "
+                "Falling back to read-only mode."
+            )
+            self.live_mode = False
+
+        log.info(
+            f"EarnManager initialised: live_mode={self.live_mode} "
+            f"(client={'present' if bybit_client else 'absent'})"
+        )
 
     # ── ADD / UPDATE ────────────────────────────────────────────────────────────
 
@@ -300,6 +345,122 @@ class EarnManager:
     def estimate_monthly_earnings(principal: float, apr: float) -> float:
         return principal * apr / 12
 
+    # ── LIVE API METHODS (gated behind live_mode flag) ──────────────────────────
+
+    async def list_available_products(
+        self, category: str = BYBIT_CATEGORY_FLEXIBLE, coin: Optional[str] = None
+    ) -> list[dict]:
+        """
+        Query Bybit for available Earn products.
+        GET /v5/earn/product (no auth required)
+
+        Per DeepSeek Task #8: returns list with productId, estimateApr,
+        coin, minStakeAmount, maxStakeAmount, status.
+        """
+        if not self.bybit_client:
+            log.warning("list_available_products called without bybit_client")
+            return []
+        try:
+            return await self.bybit_client.list_earn_products(
+                category=category, coin=coin
+            )
+        except Exception as e:
+            log.error(f"list_available_products error: {e}")
+            return []
+
+    async def subscribe_live(
+        self,
+        product_id:   str,
+        amount:       float,
+        coin:         str,
+        category:     str = BYBIT_CATEGORY_FLEXIBLE,
+        account_type: str = "FUND",
+        order_link_id: Optional[str] = None,
+    ) -> Optional[dict]:
+        """
+        Place a live Earn subscription via /v5/earn/place-order.
+
+        REQUIRES:
+        - live_mode=True
+        - bybit_client with API key + Earn permission
+        - User explicit confirmation upstream (Telegram)
+
+        Returns: order result dict with orderId, or None on failure.
+        """
+        if not self.live_mode:
+            log.error("subscribe_live called but live_mode=False")
+            return None
+        if not self.bybit_client:
+            log.error("subscribe_live called without bybit_client")
+            return None
+
+        if order_link_id is None:
+            order_link_id = f"qa-{coin.lower()}-{int(datetime.now(timezone.utc).timestamp())}"
+
+        log.info(
+            f"LIVE Earn subscribe: {category} productId={product_id} "
+            f"amount={amount} {coin} account={account_type}"
+        )
+        try:
+            result = await self.bybit_client.place_earn_order(
+                category=category,
+                order_type="Stake",
+                account_type=account_type,
+                amount=str(amount),
+                coin=coin,
+                product_id=product_id,
+                order_link_id=order_link_id,
+            )
+            return result
+        except Exception as e:
+            log.error(f"subscribe_live failed: {e}")
+            return None
+
+    async def redeem_live(
+        self,
+        product_id:    str,
+        amount:        float,
+        coin:          str,
+        category:      str = BYBIT_CATEGORY_FLEXIBLE,
+        account_type:  str = "FUND",
+        order_link_id: Optional[str] = None,
+        redeem_position_id: Optional[str] = None,
+    ) -> Optional[dict]:
+        """
+        Place a live Earn redemption via /v5/earn/place-order with orderType=Redeem.
+        """
+        if not self.live_mode or not self.bybit_client:
+            log.error("redeem_live called but live_mode disabled")
+            return None
+
+        if order_link_id is None:
+            order_link_id = f"qa-redeem-{coin.lower()}-{int(datetime.now(timezone.utc).timestamp())}"
+
+        log.info(
+            f"LIVE Earn redeem: {category} productId={product_id} "
+            f"amount={amount} {coin}"
+        )
+        try:
+            result = await self.bybit_client.place_earn_order(
+                category=category,
+                order_type="Redeem",
+                account_type=account_type,
+                amount=str(amount),
+                coin=coin,
+                product_id=product_id,
+                order_link_id=order_link_id,
+                redeem_position_id=redeem_position_id,
+            )
+            return result
+        except Exception as e:
+            log.error(f"redeem_live failed: {e}")
+            return None
+
+    @classmethod
+    def is_automatable(cls, product_type: str) -> bool:
+        """True if this product type can be auto-subscribed via API."""
+        return product_type in cls.AUTOMATABLE_PRODUCTS
+
 
 # =============================================================================
 # CLI / TEST
@@ -314,7 +475,7 @@ if __name__ == "__main__":
 
     with tempfile.TemporaryDirectory() as td:
         ledger = PnLLedger(Path(td) / "test_pnl.db")
-        em = EarnManager(ledger)
+        em = EarnManager(ledger=ledger)
 
         print(f"\n{'='*70}")
         print("EarnManager smoke test")
