@@ -1,28 +1,37 @@
 """
-bot/main.py — QuantumAlpha entry point (commit #003)
+QuantumAlpha — Main Entry Point (Commit #004 Update)
+=====================================================
 
 Wires together:
-  - Risk Kernel
-  - PnL Ledger
-  - Earn Manager (read-only or live mode)
-  - Funding Monitor (background async task)
-  - Funding Arb Strategy (paper-mode by default)
-  - Telegram bot with trading_commands router
-  - APScheduler for periodic jobs
+- Bybit Client (from commit #001)
+- Risk Kernel (from #001)
+- PnL Ledger (#001)
+- Funding Monitor + Funding Arb Strategy (#002)
+- Earn Manager (#002)
+- Telegram Bot Handlers (#002)
+- Scheduler (#003)
+- NEW: Orchestra coordinator (#004)
+- NEW: Multi-strategy: mean_reversion + cvd_divergence + dca_dips (#004)
+- NEW: Macro Event Detector (#004)
 
-Usage:
-  python -m bot.main
+Operating modes:
+    QA_MODE=paper   — paper trading only (default, safe)
+    QA_MODE=live    — live trading enabled (must explicitly set)
 
-Environment variables (see .env.example):
-  TELEGRAM_TOKEN       — bot token
-  ALLOWED_USER_ID      — your Telegram user ID
-  BYBIT_API_KEY        — optional, only needed for live trading or earn auto-mode
-  BYBIT_API_SECRET     — optional
-  BYBIT_TESTNET        — true/false (default false)
-  STARTING_EQUITY_USD  — initial equity for risk kernel (default 1000)
-  LIVE_TRADING         — false (paper mode is default)
-  LIVE_EARN_MODE       — false (read-only earn is default)
-  DATA_DIR             — where to put SQLite DBs (default ./data)
+Run:
+    python -m bot.main
+
+Environment variables (also see .env.example):
+    BYBIT_API_KEY
+    BYBIT_API_SECRET
+    BYBIT_TESTNET=false
+    TELEGRAM_BOT_TOKEN
+    TELEGRAM_CHAT_ID
+    QA_MODE=paper|live
+    QA_TOTAL_CAPITAL_USD=1000
+    QA_LIVE_EARN_MODE=false
+
+Version: 1.1 (commit #004)
 """
 
 from __future__ import annotations
@@ -32,265 +41,252 @@ import logging
 import os
 import signal
 import sys
-from pathlib import Path
+from typing import Optional
 
 from aiogram import Bot, Dispatcher
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
 
-# Optional .env loading
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
+# Existing modules (from earlier commits)
+from bot.core.bybit_client import BybitClient
+from bot.core.risk_kernel import RiskKernel
+from bot.core.pnl_ledger import PnLLedger
+from bot.core.funding_monitor import FundingMonitor
+from bot.core.earn_manager import EarnManager
+from bot.handlers.trading_commands import register_trading_handlers
+from bot.scheduler import build_scheduler
+from bot.strategies.funding_arb import FundingArbStrategy
 
-from .core.bybit_client import BybitClient
-from .core.earn_manager import EarnManager
-from .core.funding_monitor import FundingMonitor, OpportunityEvent
-from .core.pnl_ledger import PnLLedger
-from .core.risk_kernel import RiskKernel
-from .strategies.funding_arb import FundingArbStrategy
-from .handlers import trading_commands
-from .scheduler import build_scheduler
-
-log = logging.getLogger("qa_bot.main")
+# New modules (commit #004)
+from bot.core.macro_events import MacroEventDetector, default_vix_fetcher
+from bot.handlers.strategy_commands import register_strategy_handlers
+from bot.strategies.cvd_divergence import CVDDivergenceStrategy
+from bot.strategies.dca_dips import DCADipsStrategy
+from bot.strategies.mean_reversion import MeanReversionStrategy
+from bot.strategies.orchestra import OrchestraConfig, StrategyOrchestra
 
 
-# =============================================================================
-# CONFIG
-# =============================================================================
-
-def load_config() -> dict:
-    """Load + validate environment configuration."""
-    cfg = {
-        "telegram_token":      os.getenv("TELEGRAM_TOKEN", "").strip(),
-        "allowed_user_id":     os.getenv("ALLOWED_USER_ID", "0").strip(),
-        "bybit_api_key":       os.getenv("BYBIT_API_KEY", "").strip(),
-        "bybit_api_secret":    os.getenv("BYBIT_API_SECRET", "").strip(),
-        "bybit_testnet":       os.getenv("BYBIT_TESTNET", "false").lower() == "true",
-        "starting_equity_usd": float(os.getenv("STARTING_EQUITY_USD", "1000")),
-        "live_trading":        os.getenv("LIVE_TRADING", "false").lower() == "true",
-        "live_earn_mode":      os.getenv("LIVE_EARN_MODE", "false").lower() == "true",
-        "data_dir":            Path(os.getenv("DATA_DIR", "./data")),
-        "funding_poll_sec":    int(os.getenv("FUNDING_POLL_SEC", "300")),
-        "log_level":           os.getenv("LOG_LEVEL", "INFO").upper(),
-    }
-
-    if not cfg["telegram_token"]:
-        log.error("TELEGRAM_TOKEN not set — cannot start bot")
-        sys.exit(1)
-    if cfg["allowed_user_id"] == "0":
-        log.error("ALLOWED_USER_ID not set — refusing to start (security)")
-        sys.exit(1)
-
-    cfg["data_dir"].mkdir(parents=True, exist_ok=True)
-    return cfg
+# ---- logging setup ----
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler("logs/qa.log"),
+    ],
+)
+logger = logging.getLogger("qa.main")
 
 
-# =============================================================================
-# APPLICATION
-# =============================================================================
-
-class QuantumAlphaBot:
-    """Top-level coordinator for all bot components."""
-
-    def __init__(self, cfg: dict):
-        self.cfg = cfg
-
-        # ── Core components ─────────────────────────────────────────────────
-        self.ledger = PnLLedger(cfg["data_dir"] / "pnl.db")
-        self.risk_kernel = RiskKernel(
-            starting_equity_usd=cfg["starting_equity_usd"],
-        )
-
-        # ── Bybit client (optional — only needed for live mode) ─────────────
-        self.bybit_client = None
-        has_keys = bool(cfg["bybit_api_key"] and cfg["bybit_api_secret"])
-        if has_keys:
-            self.bybit_client = BybitClient(
-                api_key=cfg["bybit_api_key"],
-                api_secret=cfg["bybit_api_secret"],
-                testnet=cfg["bybit_testnet"],
-            )
-            log.info(f"BybitClient created (testnet={cfg['bybit_testnet']})")
-        else:
-            log.warning(
-                "Bybit API keys not provided — bot will run in read-only / "
-                "paper-mode only (public endpoints work)"
-            )
-
-        # ── Earn manager ────────────────────────────────────────────────────
-        self.earn_manager = EarnManager(
-            ledger=self.ledger,
-            bybit_client=self.bybit_client,
-            live_mode=cfg["live_earn_mode"] and has_keys,
-        )
-
-        # ── Funding monitor ─────────────────────────────────────────────────
-        self.funding_monitor = FundingMonitor(
-            db_path=cfg["data_dir"] / "funding_history.db",
-            poll_interval_sec=cfg["funding_poll_sec"],
-            opportunity_callback=self._on_funding_opportunity,
-        )
-
-        # ── Funding arb strategy ────────────────────────────────────────────
-        self.funding_arb = FundingArbStrategy(
-            ledger=self.ledger,
-            risk_kernel=self.risk_kernel,
-            live_trading=cfg["live_trading"] and has_keys,
-        )
-
-        # ── Telegram bot ────────────────────────────────────────────────────
-        self.tg_bot = Bot(
-            token=cfg["telegram_token"],
-            default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN_V2),
-        )
-        self.dispatcher = Dispatcher()
-        self._setup_dispatcher()
-
-        # ── Scheduler ───────────────────────────────────────────────────────
-        self.scheduler = build_scheduler(
-            funding_monitor=self.funding_monitor,
-            funding_arb=self.funding_arb,
-            bybit_client=self.bybit_client,
-            risk_kernel=self.risk_kernel,
-            ledger=self.ledger,
-        )
-
-    def _setup_dispatcher(self):
-        """Register Telegram routers and inject dependencies."""
-        # Trading commands (new in commit #003)
-        trading_commands.setup_trading_commands(
-            ledger=self.ledger,
-            risk_kernel=self.risk_kernel,
-            earn_manager=self.earn_manager,
-            funding_monitor=self.funding_monitor,
-            funding_arb=self.funding_arb,
-        )
-        self.dispatcher.include_router(trading_commands.router)
-        log.info("Trading commands router registered")
-
-    async def _on_funding_opportunity(self, event: OpportunityEvent):
-        """Telegram alert when high funding rate detected."""
-        try:
-            await self.tg_bot.send_message(
-                chat_id=int(self.cfg["allowed_user_id"]),
-                text=event.to_telegram(),
-                parse_mode=ParseMode.MARKDOWN_V2,
-            )
-        except Exception as e:
-            log.error(f"Failed to send opportunity alert: {e}")
-
-    # ── LIFECYCLE ──────────────────────────────────────────────────────────────
-
-    async def start(self):
-        log.info("=" * 70)
-        log.info("QuantumAlpha bot starting")
-        log.info(f"  data_dir       = {self.cfg['data_dir']}")
-        log.info(f"  starting_eq    = ${self.cfg['starting_equity_usd']:,.2f}")
-        log.info(f"  live_trading   = {self.cfg['live_trading']}")
-        log.info(f"  live_earn_mode = {self.cfg['live_earn_mode']}")
-        log.info(f"  bybit_testnet  = {self.cfg['bybit_testnet']}")
-        log.info("=" * 70)
-
-        # Start funding monitor background task
-        await self.funding_monitor.start()
-
-        # Start APScheduler
-        self.scheduler.start()
-
-        # Notify user via Telegram
-        try:
-            await self.tg_bot.send_message(
-                chat_id=int(self.cfg["allowed_user_id"]),
-                text=(
-                    "🟢 *QuantumAlpha online*\n"
-                    f"Mode: {'LIVE' if self.cfg['live_trading'] else 'PAPER'}\n"
-                    f"Equity: `${self.cfg['starting_equity_usd']:,.2f}`\n"
-                    "Use `/balance`, `/funding`, `/earn` to interact."
-                ),
-                parse_mode=ParseMode.MARKDOWN_V2,
-            )
-        except Exception as e:
-            log.warning(f"Couldn't send startup message: {e}")
-
-        # Start Telegram polling (blocks until shutdown)
-        log.info("Telegram polling started — bot is live")
-        await self.dispatcher.start_polling(self.tg_bot)
-
-    async def shutdown(self):
-        log.info("Shutting down QuantumAlpha bot...")
-        try:
-            self.scheduler.shutdown(wait=False)
-        except Exception as e:
-            log.warning(f"scheduler shutdown error: {e}")
-        try:
-            await self.funding_monitor.stop()
-        except Exception as e:
-            log.warning(f"funding_monitor stop error: {e}")
-        try:
-            await self.dispatcher.stop_polling()
-        except Exception as e:
-            log.warning(f"dispatcher stop error: {e}")
-        try:
-            await self.tg_bot.session.close()
-        except Exception as e:
-            log.warning(f"telegram session close error: {e}")
-        try:
-            self.ledger.close()
-        except Exception as e:
-            log.warning(f"ledger close error: {e}")
-        log.info("Shutdown complete")
+def _env(key: str, default: str = "") -> str:
+    return os.environ.get(key, default).strip()
 
 
-# =============================================================================
-# ENTRY POINT
-# =============================================================================
+def _env_bool(key: str, default: bool = False) -> bool:
+    v = _env(key, "true" if default else "false").lower()
+    return v in ("1", "true", "yes", "on")
 
-async def amain():
-    cfg = load_config()
-    logging.basicConfig(
-        level=cfg["log_level"],
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+
+def _env_float(key: str, default: float) -> float:
+    try:
+        return float(_env(key, str(default)))
+    except ValueError:
+        return default
+
+
+async def main() -> None:
+    logger.info("=" * 70)
+    logger.info("QuantumAlpha starting up — commit #004 multi-strategy")
+    logger.info("=" * 70)
+
+    # ---- 1. Configuration ----
+    qa_mode = _env("QA_MODE", "paper").lower()
+    paper_mode = qa_mode != "live"
+    total_capital = _env_float("QA_TOTAL_CAPITAL_USD", 1000.0)
+    bybit_testnet = _env_bool("BYBIT_TESTNET", False)
+    live_earn = _env_bool("QA_LIVE_EARN_MODE", False)
+
+    logger.info(
+        "Mode: %s | Total capital: $%.2f | Bybit testnet: %s | Live earn: %s",
+        qa_mode.upper(), total_capital, bybit_testnet, live_earn,
     )
 
-    app = QuantumAlphaBot(cfg)
+    # ---- 2. Bybit client ----
+    bybit = BybitClient(
+        api_key=_env("BYBIT_API_KEY"),
+        api_secret=_env("BYBIT_API_SECRET"),
+        testnet=bybit_testnet,
+    )
 
-    # Graceful shutdown on SIGTERM / SIGINT
-    loop = asyncio.get_running_loop()
+    # ---- 3. Core services ----
+    risk_kernel = RiskKernel(total_capital_usd=total_capital)
+    pnl_ledger = PnLLedger(db_path="data/pnl.db")
+
+    # ---- 4. Strategy instances ----
+    # Funding arb (primary, written in commit #002/003)
+    funding_arb = FundingArbStrategy(
+        capital_pct=0.30,
+        enabled=True,
+    )
+
+    # Mean reversion (commit #004) — paper-mode by default
+    mean_rev = MeanReversionStrategy(
+        capital_pct=0.20,
+        enabled=True,
+    )
+
+    # CVD divergence (commit #004) — DEFAULT DISABLED
+    # Enable only after walk-forward validation in ChronosBacktester
+    cvd_div = CVDDivergenceStrategy(
+        capital_pct=0.10,
+        enabled=False,
+    )
+
+    # DCA dips (commit #004) — paper-mode by default; activated by macro events
+    dca_dips = DCADipsStrategy(
+        capital_pct=0.10,
+        enabled=True,
+    )
+
+    # ---- 5. Orchestra ----
+    orchestra_config = OrchestraConfig(
+        total_capital_usd=total_capital,
+        paper_mode=paper_mode,
+        enabled_strategies=["funding_arb_v1", "mean_reversion_v1", "dca_dips_v1"],
+        max_total_drawdown_pct=0.10,
+        max_per_symbol_position_pct=0.20,
+    )
+    orchestra = StrategyOrchestra(orchestra_config)
+
+    # Register strategies if they implement the BaseStrategy contract
+    # (funding_arb_v1 from commit #002 may need adapter; documented in COMMIT_004_NOTES.md)
+    try:
+        orchestra.register(funding_arb)
+    except Exception as e:
+        logger.warning("Could not auto-register funding_arb: %s — see adapter notes", e)
+    orchestra.register(mean_rev)
+    orchestra.register(cvd_div)
+    orchestra.register(dca_dips)
+
+    logger.info("Orchestra registered with %d strategies", len(orchestra._strategies))
+
+    # ---- 6. Macro Event Detector ----
+    macro_detector = MacroEventDetector(vix_fetcher=default_vix_fetcher)
+    macro_detector.on_event(dca_dips.trigger_event)
+    logger.info("Macro detector wired to dca_dips")
+
+    # ---- 7. Funding monitor + Earn manager (existing services) ----
+    funding_monitor = FundingMonitor(bybit_client=bybit)
+    earn_manager = EarnManager(bybit_client=bybit, live_mode=live_earn)
+
+    # ---- 8. Telegram bot ----
+    bot_token = _env("TELEGRAM_BOT_TOKEN")
+    chat_id = _env("TELEGRAM_CHAT_ID")
+    if not bot_token or not chat_id:
+        logger.error("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID missing — telegram disabled")
+        bot = None
+        dp = None
+    else:
+        bot = Bot(token=bot_token)
+        dp = Dispatcher()
+
+        # Existing trading handlers (from commit #002)
+        register_trading_handlers(
+            dispatcher=dp,
+            bybit_client=bybit,
+            risk_kernel=risk_kernel,
+            pnl_ledger=pnl_ledger,
+            funding_monitor=funding_monitor,
+            earn_manager=earn_manager,
+        )
+
+        # NEW: strategy handlers (commit #004)
+        register_strategy_handlers(dp, orchestra)
+
+        logger.info("Telegram bot ready, chat_id=%s", chat_id)
+
+    # ---- 9. Scheduler ----
+    scheduler = build_scheduler(
+        bybit_client=bybit,
+        risk_kernel=risk_kernel,
+        funding_monitor=funding_monitor,
+        funding_arb=funding_arb,
+        earn_manager=earn_manager,
+        bot=bot,
+        chat_id=chat_id,
+        # NEW: pass orchestra for multi-strategy ticks
+        orchestra=orchestra,
+    )
+
+    # ---- 10. Run all background tasks ----
+    tasks = [
+        asyncio.create_task(funding_monitor.start(), name="funding_monitor"),
+        asyncio.create_task(macro_detector.start(), name="macro_detector"),
+    ]
+
+    if bot is not None and dp is not None:
+        tasks.append(asyncio.create_task(dp.start_polling(bot), name="telegram_polling"))
+
+    scheduler.start()
+    logger.info("Scheduler started with %d jobs", len(scheduler.get_jobs()))
+
+    # Send startup notification
+    if bot and chat_id:
+        try:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"🚀 *QuantumAlpha v1.1 запущен*\n"
+                    f"Mode: `{qa_mode.upper()}`\n"
+                    f"Capital: `${total_capital:,.2f}`\n"
+                    f"Strategies: `{len(orchestra._strategies)}`\n"
+                    f"Use /strategies для статуса"
+                ),
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            logger.warning("Startup notification failed: %s", e)
+
+    # ---- 11. Graceful shutdown handling ----
     stop_event = asyncio.Event()
 
-    def _handle_signal():
-        log.info("Signal received — initiating shutdown")
+    def _handle_signal(signame: str):
+        logger.info("Received %s — shutting down", signame)
         stop_event.set()
 
-    for sig in (signal.SIGTERM, signal.SIGINT):
+    loop = asyncio.get_running_loop()
+    for sig_name in ("SIGINT", "SIGTERM"):
         try:
-            loop.add_signal_handler(sig, _handle_signal)
-        except NotImplementedError:
-            # Windows
+            loop.add_signal_handler(
+                getattr(signal, sig_name),
+                lambda s=sig_name: _handle_signal(s),
+            )
+        except (NotImplementedError, ValueError):
+            # Windows or non-main thread — ignore
             pass
 
-    start_task = asyncio.create_task(app.start())
-    stop_task  = asyncio.create_task(stop_event.wait())
+    await stop_event.wait()
 
-    done, pending = await asyncio.wait(
-        [start_task, stop_task],
-        return_when=asyncio.FIRST_COMPLETED,
-    )
-    for t in pending:
-        t.cancel()
-    await app.shutdown()
+    # ---- 12. Shutdown ----
+    logger.info("Shutting down…")
+    macro_detector.stop()
+    scheduler.shutdown(wait=False)
 
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
 
-def main():
-    """CLI entry. Use: `python -m bot.main`"""
-    try:
-        asyncio.run(amain())
-    except KeyboardInterrupt:
-        log.info("Interrupted")
+    if bot:
+        await bot.session.close()
+
+    logger.info("QuantumAlpha stopped cleanly")
 
 
 if __name__ == "__main__":
-    main()
+    # Ensure logs directory exists
+    os.makedirs("logs", exist_ok=True)
+    os.makedirs("data", exist_ok=True)
+
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user")
+        sys.exit(0)
