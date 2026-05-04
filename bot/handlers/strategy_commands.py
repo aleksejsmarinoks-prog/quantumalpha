@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import Any, Dict, List, Optional
 
 from aiogram import Router, types
@@ -65,6 +66,11 @@ def _format_strategy_summary(sid: str, status_dict: Dict[str, Any]) -> str:
     )
 
 
+def _is_authorized(user_id: int) -> bool:
+    allowed = os.getenv("ALLOWED_USER_ID", "0")
+    return str(user_id) == str(allowed)
+
+
 # ---- shared orchestra reference ----
 # Set by register_strategy_handlers()
 _orchestra: Optional[StrategyOrchestra] = None
@@ -84,6 +90,8 @@ def register_strategy_handlers(
 # ---- /strategies ----
 @router.message(Command("strategies"))
 async def cmd_strategies(message: types.Message) -> None:
+    if not _is_authorized(message.from_user.id):
+        return
     if _orchestra is None:
         await message.answer("❌ Orchestra not initialized")
         return
@@ -111,6 +119,8 @@ async def cmd_strategies(message: types.Message) -> None:
 # ---- /strat_status <id> ----
 @router.message(Command("strat_status"))
 async def cmd_strat_status(message: types.Message, command: CommandObject) -> None:
+    if not _is_authorized(message.from_user.id):
+        return
     if _orchestra is None:
         await message.answer("❌ Orchestra not initialized")
         return
@@ -146,6 +156,8 @@ async def cmd_strat_status(message: types.Message, command: CommandObject) -> No
 # ---- /enable_strat <id> ----
 @router.message(Command("enable_strat"))
 async def cmd_enable_strat(message: types.Message, command: CommandObject) -> None:
+    if not _is_authorized(message.from_user.id):
+        return
     if _orchestra is None:
         await message.answer("❌ Orchestra not initialized")
         return
@@ -187,6 +199,8 @@ async def cmd_enable_strat(message: types.Message, command: CommandObject) -> No
 # ---- /disable_strat <id> ----
 @router.message(Command("disable_strat"))
 async def cmd_disable_strat(message: types.Message, command: CommandObject) -> None:
+    if not _is_authorized(message.from_user.id):
+        return
     if _orchestra is None:
         await message.answer("❌ Orchestra not initialized")
         return
@@ -220,6 +234,8 @@ async def cmd_disable_strat(message: types.Message, command: CommandObject) -> N
 # ---- /halt_strat <id> ----
 @router.message(Command("halt_strat"))
 async def cmd_halt_strat(message: types.Message, command: CommandObject) -> None:
+    if not _is_authorized(message.from_user.id):
+        return
     if _orchestra is None:
         await message.answer("❌ Orchestra not initialized")
         return
@@ -243,6 +259,8 @@ async def cmd_halt_strat(message: types.Message, command: CommandObject) -> None
 # ---- /resume_strat <id> ----
 @router.message(Command("resume_strat"))
 async def cmd_resume_strat(message: types.Message, command: CommandObject) -> None:
+    if not _is_authorized(message.from_user.id):
+        return
     if _orchestra is None:
         await message.answer("❌ Orchestra not initialized")
         return
@@ -273,6 +291,8 @@ async def cmd_resume_strat(message: types.Message, command: CommandObject) -> No
 # ---- /strat_positions ----
 @router.message(Command("strat_positions"))
 async def cmd_strat_positions(message: types.Message) -> None:
+    if not _is_authorized(message.from_user.id):
+        return
     if _orchestra is None:
         await message.answer("❌ Orchestra not initialized")
         return
@@ -302,6 +322,8 @@ async def cmd_strat_positions(message: types.Message) -> None:
 # ---- /orchestra ----
 @router.message(Command("orchestra"))
 async def cmd_orchestra(message: types.Message) -> None:
+    if not _is_authorized(message.from_user.id):
+        return
     if _orchestra is None:
         await message.answer("❌ Orchestra not initialized")
         return
