@@ -1,39 +1,16 @@
 """
-QuantumAlpha — Main Entry Point (Commit #004 Update)
-=====================================================
+QuantumAlpha — main entrypoint v1.2 (commit #004 + integration fixes)
 
-Wires together:
-- Bybit Client (from commit #001)
-- Risk Kernel (from #001)
-- PnL Ledger (#001)
-- Funding Monitor + Funding Arb Strategy (#002)
-- Earn Manager (#002)
-- Telegram Bot Handlers (#002)
-- Scheduler (#003)
-- NEW: Orchestra coordinator (#004)
-- NEW: Multi-strategy: mean_reversion + cvd_divergence + dca_dips (#004)
-- NEW: Macro Event Detector (#004)
-
-Operating modes:
-    QA_MODE=paper   — paper trading only (default, safe)
-    QA_MODE=live    — live trading enabled (must explicitly set)
-
-Run:
-    python -m bot.main
-
-Environment variables (also see .env.example):
-    BYBIT_API_KEY
-    BYBIT_API_SECRET
-    BYBIT_TESTNET=false
-    TELEGRAM_BOT_TOKEN
-    TELEGRAM_CHAT_ID
-    QA_MODE=paper|live
-    QA_TOTAL_CAPITAL_USD=1000
-    QA_LIVE_EARN_MODE=false
-
-Version: 1.1 (commit #004)
+Fixes applied vs commit #004 original:
+  - RiskKernel: starting_equity_usd (was: total_capital_usd)
+  - PnLLedger: Path object (was: str)
+  - FundingArbStrategy: (ledger, risk_kernel) (was: capital_pct, enabled)
+  - FundingMonitor: (db_path=Path) (was: bybit_client=)
+  - EarnManager: (ledger, bybit_client, live_mode) (was: missing ledger)
+  - Trading handlers: setup_trading_commands(ledger, risk_kernel, earn_manager, funding_monitor, funding_arb)
+                      + dp.include_router(trading_router)
+                      (was: register_trading_handlers with wrong kwargs)
 """
-
 from __future__ import annotations
 
 import asyncio
@@ -41,17 +18,21 @@ import logging
 import os
 import signal
 import sys
+from pathlib import Path
 from typing import Optional
+
+from dotenv import load_dotenv
+load_dotenv()
 
 from aiogram import Bot, Dispatcher
 
-# Existing modules (from earlier commits)
+# Existing modules (commits #001-003)
 from bot.core.bybit_client import BybitClient
 from bot.core.risk_kernel import RiskKernel
 from bot.core.pnl_ledger import PnLLedger
 from bot.core.funding_monitor import FundingMonitor
 from bot.core.earn_manager import EarnManager
-from bot.handlers.trading_commands import register_trading_handlers
+from bot.handlers.trading_commands import setup_trading_commands, router as trading_router
 from bot.scheduler import build_scheduler
 from bot.strategies.funding_arb import FundingArbStrategy
 
@@ -65,6 +46,9 @@ from bot.strategies.orchestra import OrchestraConfig, StrategyOrchestra
 
 
 # ---- logging setup ----
+os.makedirs("logs", exist_ok=True)
+os.makedirs("data", exist_ok=True)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -94,7 +78,7 @@ def _env_float(key: str, default: float) -> float:
 
 async def main() -> None:
     logger.info("=" * 70)
-    logger.info("QuantumAlpha starting up — commit #004 multi-strategy")
+    logger.info("QuantumAlpha starting up — commit #004 multi-strategy (integration-fixed)")
     logger.info("=" * 70)
 
     # ---- 1. Configuration ----
@@ -117,36 +101,42 @@ async def main() -> None:
     )
 
     # ---- 3. Core services ----
-    risk_kernel = RiskKernel(total_capital_usd=total_capital)
-    pnl_ledger = PnLLedger(db_path="data/pnl.db")
+    risk_kernel = RiskKernel(starting_equity_usd=total_capital)
+    pnl_ledger = PnLLedger(db_path=Path("data/pnl.db"))
 
-    # ---- 4. Strategy instances ----
-    # Funding arb (primary, written in commit #002/003)
-    funding_arb = FundingArbStrategy(
-        capital_pct=0.30,
-        enabled=True,
+    # ---- 4. Funding monitor (independent service — uses public Bybit endpoint) ----
+    funding_monitor = FundingMonitor(db_path=Path("data/funding.db"))
+
+    # ---- 5. Earn manager ----
+    earn_manager = EarnManager(
+        ledger=pnl_ledger,
+        bybit_client=bybit,
+        live_mode=live_earn,
     )
 
-    # Mean reversion (commit #004) — paper-mode by default
+    # ---- 6. Strategy instances ----
+    # Funding arb (primary, commit #002/003) — uses ledger + risk_kernel API
+    funding_arb = FundingArbStrategy(
+        ledger=pnl_ledger,
+        risk_kernel=risk_kernel,
+        live_trading=not paper_mode,
+    )
+
+    # Commit #004 strategies — paper-mode capital_pct/enabled API
     mean_rev = MeanReversionStrategy(
         capital_pct=0.20,
         enabled=True,
     )
-
-    # CVD divergence (commit #004) — DEFAULT DISABLED
-    # Enable only after walk-forward validation in ChronosBacktester
     cvd_div = CVDDivergenceStrategy(
         capital_pct=0.10,
-        enabled=False,
+        enabled=False,  # default disabled, enable after walk-forward validation
     )
-
-    # DCA dips (commit #004) — paper-mode by default; activated by macro events
     dca_dips = DCADipsStrategy(
         capital_pct=0.10,
         enabled=True,
     )
 
-    # ---- 5. Orchestra ----
+    # ---- 7. Orchestra ----
     orchestra_config = OrchestraConfig(
         total_capital_usd=total_capital,
         paper_mode=paper_mode,
@@ -156,8 +146,6 @@ async def main() -> None:
     )
     orchestra = StrategyOrchestra(orchestra_config)
 
-    # Register strategies if they implement the BaseStrategy contract
-    # (funding_arb_v1 from commit #002 may need adapter; documented in COMMIT_004_NOTES.md)
     try:
         orchestra.register(funding_arb)
     except Exception as e:
@@ -168,16 +156,12 @@ async def main() -> None:
 
     logger.info("Orchestra registered with %d strategies", len(orchestra._strategies))
 
-    # ---- 6. Macro Event Detector ----
+    # ---- 8. Macro Event Detector ----
     macro_detector = MacroEventDetector(vix_fetcher=default_vix_fetcher)
     macro_detector.on_event(dca_dips.trigger_event)
     logger.info("Macro detector wired to dca_dips")
 
-    # ---- 7. Funding monitor + Earn manager (existing services) ----
-    funding_monitor = FundingMonitor(bybit_client=bybit)
-    earn_manager = EarnManager(bybit_client=bybit, live_mode=live_earn)
-
-    # ---- 8. Telegram bot ----
+    # ---- 9. Telegram bot ----
     bot_token = _env("TELEGRAM_BOT_TOKEN")
     chat_id = _env("TELEGRAM_CHAT_ID")
     if not bot_token or not chat_id:
@@ -188,22 +172,23 @@ async def main() -> None:
         bot = Bot(token=bot_token)
         dp = Dispatcher()
 
-        # Existing trading handlers (from commit #002)
-        register_trading_handlers(
-            dispatcher=dp,
-            bybit_client=bybit,
+        # Inject dependencies into trading_commands module-level _dependencies dict
+        setup_trading_commands(
+            ledger=pnl_ledger,
             risk_kernel=risk_kernel,
-            pnl_ledger=pnl_ledger,
-            funding_monitor=funding_monitor,
             earn_manager=earn_manager,
+            funding_monitor=funding_monitor,
+            funding_arb=funding_arb,
         )
+        # Then attach the trading_commands router to the dispatcher
+        dp.include_router(trading_router)
 
-        # NEW: strategy handlers (commit #004)
+        # Strategy handlers (commit #004)
         register_strategy_handlers(dp, orchestra)
 
         logger.info("Telegram bot ready, chat_id=%s", chat_id)
 
-    # ---- 9. Scheduler ----
+    # ---- 10. Scheduler ----
     scheduler = build_scheduler(
         bybit_client=bybit,
         risk_kernel=risk_kernel,
@@ -212,11 +197,10 @@ async def main() -> None:
         earn_manager=earn_manager,
         bot=bot,
         chat_id=chat_id,
-        # NEW: pass orchestra for multi-strategy ticks
         orchestra=orchestra,
     )
 
-    # ---- 10. Run all background tasks ----
+    # ---- 11. Run all background tasks ----
     tasks = [
         asyncio.create_task(funding_monitor.start(), name="funding_monitor"),
         asyncio.create_task(macro_detector.start(), name="macro_detector"),
@@ -234,7 +218,7 @@ async def main() -> None:
             await bot.send_message(
                 chat_id=chat_id,
                 text=(
-                    f"🚀 *QuantumAlpha v1.1 запущен*\n"
+                    f"🚀 *QuantumAlpha v1.2 запущен*\n"
                     f"Mode: `{qa_mode.upper()}`\n"
                     f"Capital: `${total_capital:,.2f}`\n"
                     f"Strategies: `{len(orchestra._strategies)}`\n"
@@ -245,7 +229,7 @@ async def main() -> None:
         except Exception as e:
             logger.warning("Startup notification failed: %s", e)
 
-    # ---- 11. Graceful shutdown handling ----
+    # ---- 12. Graceful shutdown handling ----
     stop_event = asyncio.Event()
 
     def _handle_signal(signame: str):
@@ -260,14 +244,16 @@ async def main() -> None:
                 lambda s=sig_name: _handle_signal(s),
             )
         except (NotImplementedError, ValueError):
-            # Windows or non-main thread — ignore
             pass
 
     await stop_event.wait()
 
-    # ---- 12. Shutdown ----
+    # ---- 13. Shutdown ----
     logger.info("Shutting down…")
-    macro_detector.stop()
+    try:
+        macro_detector.stop()
+    except Exception:
+        pass
     scheduler.shutdown(wait=False)
 
     for task in tasks:
@@ -281,12 +267,10 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    # Ensure logs directory exists
-    os.makedirs("logs", exist_ok=True)
-    os.makedirs("data", exist_ok=True)
-
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("Interrupted by user")
-        sys.exit(0)
+    except Exception as e:
+        logger.exception("Fatal error: %s", e)
+        sys.exit(1)
