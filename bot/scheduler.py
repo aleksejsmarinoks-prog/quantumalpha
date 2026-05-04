@@ -55,7 +55,9 @@ def build_scheduler(
     # Job 1: funding arb evaluate every 15 min
     async def _funding_arb_eval():
         try:
-            await funding_arb.evaluate_and_execute(funding_monitor)
+            rates = await funding_monitor.fetch_once()
+            if rates:
+                await funding_arb.evaluate_cycle(bybit_client, rates)
         except Exception as e:
             logger.exception("funding_arb_evaluate failed: %s", e)
 

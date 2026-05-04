@@ -130,6 +130,19 @@ class BybitClient:
         self._rate_status: dict[str, int] = {}
 
     async def __aenter__(self):
+        await self._ensure_session()
+        return self
+
+    async def __aexit__(self, *_):
+        if self._session:
+            await self._session.close()
+            self._session = None
+
+    async def _ensure_session(self) -> None:
+        """Lazily create the aiohttp session. Safe to call from any HTTP method.
+        Supports both `async with BybitClient()` and direct construction."""
+        if self._session is not None and not self._session.closed:
+            return
         self._session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=DEFAULT_TIMEOUT)
         )
@@ -137,11 +150,6 @@ class BybitClient:
             log.info(f"BybitClient: authenticated mode (key={self.api_key[:8]}...)")
         else:
             log.info("BybitClient: public-only mode (no API keys)")
-        return self
-
-    async def __aexit__(self, *_):
-        if self._session:
-            await self._session.close()
 
     # ── PRIVATE: SIGNING ────────────────────────────────────────────────────────
 
@@ -170,6 +178,7 @@ class BybitClient:
 
     async def public_get(self, endpoint: str, params: dict = None) -> dict:
         """GET request to a public endpoint (no auth)."""
+        await self._ensure_session()
         params = params or {}
         url = f"{self.base_url}{endpoint}"
         async with self._session.get(url, params=params) as r:
@@ -193,6 +202,7 @@ class BybitClient:
             return data.get("result", {})
 
     async def private_get(self, endpoint: str, params: dict = None) -> dict:
+        await self._ensure_session()
         params = params or {}
         param_str = "&".join([f"{k}={v}" for k, v in sorted(params.items())])
         headers   = self._auth_headers(param_str)
@@ -207,6 +217,7 @@ class BybitClient:
             return data.get("result", {})
 
     async def private_post(self, endpoint: str, payload: dict) -> dict:
+        await self._ensure_session()
         body    = json.dumps(payload, separators=(",", ":"))
         headers = self._auth_headers(body)
         url     = f"{self.base_url}{endpoint}"
@@ -300,6 +311,23 @@ class BybitClient:
         # Bybit returns newest first; reverse for chronological order
         return [Kline.from_bybit_v5(r) for r in reversed(raw_list)]
 
+    async def get_klines(
+        self, category: str = "linear", symbol: str = "",
+        interval: str = "60", limit: int = 200,
+    ) -> list[list[str]]:
+        """
+        Raw V5 klines, chronological (oldest first).
+        Each row: [start_ms, open, high, low, close, volume, turnover] as strings.
+        """
+        result = await self.public_get(
+            "/v5/market/kline",
+            params={
+                "category": category, "symbol": symbol,
+                "interval": interval, "limit": limit,
+            },
+        )
+        return list(reversed(result.get("list", [])))
+
     async def fetch_orderbook(
         self, symbol: str, limit: int = 50, category: str = "linear"
     ) -> dict:
@@ -346,6 +374,20 @@ class BybitClient:
             }
             for c in coins
         }
+
+    async def get_unified_balance(self) -> dict:
+        """
+        Account-level UNIFIED wallet snapshot.
+        Returns the raw V5 account dict with keys like totalEquity,
+        totalWalletBalance, totalAvailableBalance, totalMarginBalance, coin[].
+        Empty dict if account list is empty.
+        """
+        result = await self.private_get(
+            "/v5/account/wallet-balance",
+            params={"accountType": "UNIFIED"},
+        )
+        accts = result.get("list", [])
+        return accts[0] if accts else {}
 
     async def fetch_positions(
         self, category: str = "linear", symbol: Optional[str] = None
