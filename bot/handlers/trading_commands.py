@@ -389,7 +389,7 @@ async def cmd_risk_status(message: Message):
     )
     if s["halt_until_utc"]:
         text += f"\n  Halt until: `{s['halt_until_utc'][:19]}`"
-    await message.answer(_md_escape(text), parse_mode="MarkdownV2")
+    await message.answer(_md_escape(text))
 
 
 # =============================================================================

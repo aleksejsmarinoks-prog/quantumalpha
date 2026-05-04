@@ -105,7 +105,7 @@ async def cmd_strategies(message: types.Message) -> None:
         f"DD: {status['drawdown_pct']*100:.2f}%_"
     )
 
-    await message.answer("\n".join(lines), parse_mode="Markdown")
+    await message.answer("\n".join(lines))
 
 
 # ---- /strat_status <id> ----
@@ -121,7 +121,7 @@ async def cmd_strat_status(message: types.Message, command: CommandObject) -> No
     sid = command.args.strip()
     strat = _orchestra.get_strategy(sid)
     if strat is None:
-        await message.answer(f"❌ Unknown strategy: `{sid}`", parse_mode="Markdown")
+        await message.answer(f"❌ Unknown strategy: `{sid}`")
         return
 
     status_dict = strat.get_status_dict()
@@ -140,7 +140,7 @@ async def cmd_strat_status(message: types.Message, command: CommandObject) -> No
             for sym, p in positions.items():
                 text_lines.append(f"• `{sym}`: {p}")
 
-    await message.answer("\n".join(text_lines), parse_mode="Markdown")
+    await message.answer("\n".join(text_lines))
 
 
 # ---- /enable_strat <id> ----
@@ -159,7 +159,7 @@ async def cmd_enable_strat(message: types.Message, command: CommandObject) -> No
 
     strat = _orchestra.get_strategy(sid)
     if strat is None:
-        await message.answer(f"❌ Unknown strategy: `{sid}`", parse_mode="Markdown")
+        await message.answer(f"❌ Unknown strategy: `{sid}`")
         return
 
     if mode not in ("paper", "live"):
@@ -180,7 +180,6 @@ async def cmd_enable_strat(message: types.Message, command: CommandObject) -> No
 
     await message.answer(
         f"✅ Strategy `{sid}` enabled in {mode.upper()} mode.",
-        parse_mode="Markdown",
     )
     logger.info("Strategy %s enabled in %s mode", sid, mode)
 
@@ -198,7 +197,7 @@ async def cmd_disable_strat(message: types.Message, command: CommandObject) -> N
     sid = command.args.strip()
     strat = _orchestra.get_strategy(sid)
     if strat is None:
-        await message.answer(f"❌ Unknown strategy: `{sid}`", parse_mode="Markdown")
+        await message.answer(f"❌ Unknown strategy: `{sid}`")
         return
 
     # Safety: warn if there are open positions
@@ -214,7 +213,6 @@ async def cmd_disable_strat(message: types.Message, command: CommandObject) -> N
     strat.set_status(StrategyStatus.DISABLED)
     await message.answer(
         f"⚫ Strategy `{sid}` disabled.",
-        parse_mode="Markdown",
     )
     logger.info("Strategy %s disabled", sid)
 
@@ -232,13 +230,12 @@ async def cmd_halt_strat(message: types.Message, command: CommandObject) -> None
     sid = command.args.strip()
     strat = _orchestra.get_strategy(sid)
     if strat is None:
-        await message.answer(f"❌ Unknown strategy: `{sid}`", parse_mode="Markdown")
+        await message.answer(f"❌ Unknown strategy: `{sid}`")
         return
 
     strat.set_status(StrategyStatus.HALTED)
     await message.answer(
         f"🔴 Strategy `{sid}` HALTED. Manual /resume_strat required.",
-        parse_mode="Markdown",
     )
     logger.warning("Strategy %s halted", sid)
 
@@ -256,13 +253,12 @@ async def cmd_resume_strat(message: types.Message, command: CommandObject) -> No
     sid = command.args.strip()
     strat = _orchestra.get_strategy(sid)
     if strat is None:
-        await message.answer(f"❌ Unknown strategy: `{sid}`", parse_mode="Markdown")
+        await message.answer(f"❌ Unknown strategy: `{sid}`")
         return
 
     if strat.status not in (StrategyStatus.HALTED, StrategyStatus.COOLDOWN):
         await message.answer(
             f"⚠️ Strategy `{sid}` is in {strat.status.value} state, not HALTED/COOLDOWN.",
-            parse_mode="Markdown",
         )
         return
 
@@ -270,7 +266,6 @@ async def cmd_resume_strat(message: types.Message, command: CommandObject) -> No
     strat.set_status(StrategyStatus.PAPER if _orchestra.config.paper_mode else StrategyStatus.LIVE)
     await message.answer(
         f"🟢 Strategy `{sid}` resumed.",
-        parse_mode="Markdown",
     )
     logger.info("Strategy %s resumed", sid)
 
@@ -301,7 +296,7 @@ async def cmd_strat_positions(message: types.Message) -> None:
     if not any_positions:
         lines.append("_No active positions._")
 
-    await message.answer("\n".join(lines), parse_mode="Markdown")
+    await message.answer("\n".join(lines))
 
 
 # ---- /orchestra ----
@@ -336,4 +331,4 @@ async def cmd_orchestra(message: types.Message) -> None:
         for sym, exp in exposures.items():
             lines.append(f"• `{sym}`: ${exp:.2f}")
 
-    await message.answer("\n".join(lines), parse_mode="Markdown")
+    await message.answer("\n".join(lines))
