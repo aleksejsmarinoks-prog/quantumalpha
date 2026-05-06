@@ -1,0 +1,22 @@
+# QA Trade Trigger — additional dependencies
+# Add these to project's main requirements.txt
+# Format: pip install -r requirements_additions.txt --break-system-packages
+
+# Anthropic SDK (Claude L2 classifier)
+# CHECK FIRST: may already be installed if Diplomatic Feed was attempted previously.
+# Run on VPS: pip show anthropic
+anthropic>=0.40.0
+
+# Pytest harness — NEW for the entire project (no tests existed before)
+pytest>=8.0.0
+pytest-asyncio>=0.24.0
+
+# RSS parsing for sources phase 3.5+ (WhiteHouse, OFAC feeds)
+feedparser>=6.0.11
+
+# httpx for Polymarket API client (no auth, public REST)
+# Likely already installed via aiogram, pin if needed
+httpx>=0.27.0
+
+# NOTE: aiogram, python-dotenv, ccxt, apscheduler should already be in
+# the main requirements.txt. Do NOT duplicate them here.

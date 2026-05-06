@@ -1,0 +1,19 @@
+[Unit]
+Description=QuantumAlpha Trade Trigger Bot
+After=network-online.target qa-bot.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=qa
+Group=qa
+WorkingDirectory=/home/qa/quantumalpha
+EnvironmentFile=/home/qa/quantumalpha/.env
+ExecStart=/home/qa/quantumalpha/venv/bin/python -m bot.trade_trigger.bot_runner
+Restart=always
+RestartSec=10
+StandardOutput=append:/home/qa/quantumalpha/logs/trade_trigger.log
+StandardError=append:/home/qa/quantumalpha/logs/trade_trigger.log
+
+[Install]
+WantedBy=multi-user.target
