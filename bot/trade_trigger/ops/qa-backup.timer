@@ -1,0 +1,12 @@
+[Unit]
+Description=Run QuantumAlpha backup daily at 03:00 UTC
+Requires=qa-backup.service
+
+[Timer]
+OnCalendar=*-*-* 03:00:00 UTC
+Persistent=true                # if missed (VPS off), run on next boot
+RandomizedDelaySec=300         # spread load — random 0-5min jitter
+Unit=qa-backup.service
+
+[Install]
+WantedBy=timers.target

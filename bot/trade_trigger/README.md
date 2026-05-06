@@ -1,8 +1,10 @@
 # QA Trade Trigger
 
-**Module version:** 0.2.0 (Phase 3 — Polymarket + Pipeline orchestrator)
-**Status:** Tests pass 83/83 in 1.3s. Polymarket source LIVE. Other sources Phase 3.5.
+**Module version:** 0.4.0 (Phase 4 — Anti-Bias + RSS + Calibration + Backtest)
+**Status:** Tests pass 153/153 in 3.7s. Backtest 5/5 cases.
 **Target deployment:** `/home/qa/quantumalpha/bot/trade_trigger/`
+
+For deployment of this version, see **DEPLOY_PHASE_4.md**.
 
 ---
 
@@ -64,28 +66,30 @@ Five filter gates (any single failure → no fire):
 ```
 bot/trade_trigger/
 ├── __init__.py                    Public API
+├── README.md                      This file
+├── DEPLOY_PHASE_3_5.md            Step-by-step deployment guide
 ├── models.py                      NewsEvent, TradeSignal, etc.
 ├── trade_trigger_mapping.py       31 event types → tickers
 ├── classifier.py                  L1 heuristic + L2 Claude API
-│                                  (incl. polymarket-specific keyword rules)
-├── pipeline.py                    PipelineOrchestrator — main glue [Phase 3]
-├── db.py                          SQLite layer (events / classifications /
-│                                  signals / audit / polymarket_odds_history)
-├── bot_runner.py                  Telegram Bot #2 (aiogram 3.27)
+├── pipeline.py                    PipelineOrchestrator — main glue
+├── alerts.py                      Telegram message + keyboard rendering [3.5]
+├── db.py                          SQLite layer + read helpers for bot cmds
+├── bot_runner.py                  Telegram Bot #2 — full integration [3.5]
 ├── filters/
-│   ├── velocity_tracker.py        Stale event rejector
-│   ├── corroboration_gate.py      Cross-source verifier (closes QA spec gap)
-│   └── anti_bias_check.py         Live RSI/price gate (closes QA spec gap)
+│   ├── velocity_tracker.py
+│   ├── corroboration_gate.py
+│   └── anti_bias_check.py         (DISABLED in 3.5; Phase 4 will enable)
 ├── sources/
-│   └── polymarket.py              Polymarket odds shift detector [Phase 3]
-└── tests/
-    ├── conftest.py                Pytest fixtures
-    ├── test_classifier.py         Including REAL Hormuz May 3 event
+│   └── polymarket.py              LIVE
+└── tests/                         105 pytest cases
+    ├── conftest.py
+    ├── test_classifier.py
     ├── test_db.py
     ├── test_filters.py
     ├── test_mapping.py
-    ├── test_polymarket.py         [Phase 3]
-    └── test_pipeline.py           [Phase 3]
+    ├── test_polymarket.py
+    ├── test_pipeline.py
+    └── test_alerts.py             [3.5]
 ```
 
 ---

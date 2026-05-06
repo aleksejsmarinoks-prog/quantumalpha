@@ -446,6 +446,68 @@ class TradeTriggerDB:
             )
 
     # -----------------------------------------------------------------------
+    # Read helpers for bot commands (/tt_audit, /tt_sources, /tt_recent)
+    # -----------------------------------------------------------------------
+
+    def get_signal_by_id(self, signal_id: int) -> Optional[dict]:
+        """Return triggered signal as dict, joined with raw event headline."""
+        with self._conn() as c:
+            row = c.execute(
+                """SELECT s.*, e.headline, e.source_domain
+                   FROM triggered_signals s
+                   LEFT JOIN news_events e ON e.raw_id = s.raw_id
+                   WHERE s.id = ?""",
+                (signal_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def get_audit_trail(self, raw_id: str) -> List[dict]:
+        """Return all filter_audit_log rows for an event, oldest first."""
+        with self._conn() as c:
+            rows = c.execute(
+                """SELECT filter_name, passed, reason, metadata_json, checked_utc
+                   FROM filter_audit_log
+                   WHERE raw_id = ?
+                   ORDER BY checked_utc ASC, id ASC""",
+                (raw_id,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def recent_signals(self, limit: int = 10) -> List[dict]:
+        """Return N most recent triggered signals, newest first."""
+        with self._conn() as c:
+            rows = c.execute(
+                """SELECT s.id, s.event_type, s.actionability_score,
+                          s.user_action, s.fired_utc,
+                          e.headline, e.source_domain
+                   FROM triggered_signals s
+                   LEFT JOIN news_events e ON e.raw_id = s.raw_id
+                   ORDER BY s.fired_utc DESC
+                   LIMIT ?""",
+                (limit,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def all_source_health(self) -> List[dict]:
+        """Return health row for every registered source."""
+        with self._conn() as c:
+            rows = c.execute(
+                """SELECT source_name, last_poll_utc, last_success_utc,
+                          last_error, consecutive_fails, total_polls, total_events
+                   FROM source_health
+                   ORDER BY source_name"""
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def heartbeat_status(self) -> List[dict]:
+        """All component heartbeats for /tt_status verbose."""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT component, last_pulse_utc, metadata_json FROM heartbeat"
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    # -----------------------------------------------------------------------
     # Polymarket odds history
     # -----------------------------------------------------------------------
 

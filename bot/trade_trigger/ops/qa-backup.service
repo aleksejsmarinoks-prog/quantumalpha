@@ -1,0 +1,11 @@
+[Unit]
+Description=QuantumAlpha SQLite backup
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=qa
+Group=qa
+ExecStart=/home/qa/quantumalpha/ops/backup.sh
+StandardOutput=append:/home/qa/backups/backup.log
+StandardError=append:/home/qa/backups/backup.log

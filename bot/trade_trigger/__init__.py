@@ -58,7 +58,15 @@ from .pipeline import (
     PipelineDecision,
 )
 
-__version__ = "0.2.0"
+from .alerts import (
+    format_alert,
+    format_audit,
+    format_sources,
+    format_recent,
+    build_alert_keyboard,
+)
+
+__version__ = "0.3.5"
 
 __all__ = [
     "NewsEvent", "AssetTrigger", "TradeSignal", "ClassificationResult",
@@ -69,4 +77,6 @@ __all__ = [
     "is_event_supported", "get_max_half_life",
     "EXCLUDED_TICKERS", "EVENT_ASSET_MAPPING",
     "PipelineOrchestrator", "PipelineConfig", "PipelineDecision",
+    "format_alert", "format_audit", "format_sources", "format_recent",
+    "build_alert_keyboard",
 ]

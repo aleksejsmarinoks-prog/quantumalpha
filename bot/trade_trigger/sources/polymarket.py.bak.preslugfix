@@ -75,53 +75,53 @@ class MarketSpec:
 # Default watchlist — covers QA's primary regime drivers.
 # Update this list as new high-stakes markets appear on Polymarket.
 DEFAULT_WATCHLIST: List[MarketSpec] = [
-    # Iran / regional escalation
+    # Iran / Hormuz
     MarketSpec(
-        slug="will-the-us-invade-iran-before-2027",
+        slug="will-iran-close-the-strait-of-hormuz-in-may-2026",
         outcome="Yes",
         event_type="hormuz_escalation",
         direction="up",
         shift_threshold=0.05,
-        label="US-invades-Iran",
+        label="Iran-Hormuz-closure",
     ),
     MarketSpec(
-        slug="will-the-us-invade-iran-before-2027",
+        slug="will-iran-close-the-strait-of-hormuz-in-may-2026",
         outcome="Yes",
         event_type="hormuz_easing",
         direction="down",
         shift_threshold=0.05,
-        label="US-Iran-de-escalation",
+        label="Iran-Hormuz-closure",
     ),
     MarketSpec(
-        slug="us-iran-nuclear-deal-before-2027",
+        slug="us-iran-deal-by-may-2026",
         outcome="Yes",
         event_type="iran_us_deal_signal",
         direction="up",
         shift_threshold=0.07,
-        label="US-Iran-nuclear-deal",
+        label="US-Iran-deal",
     ),
 
     # Fed / monetary
     MarketSpec(
-        slug="will-no-fed-rate-cuts-happen-in-2026",
-        outcome="No",
+        slug="fed-rate-cut-in-june-2026",
+        outcome="Yes",
         event_type="fed_dovish_signal",
         direction="up",
         shift_threshold=0.07,
-        label="Fed-cuts-coming",
+        label="Fed-June-cut",
     ),
     MarketSpec(
-        slug="will-5-fed-rate-cuts-happen-in-2026",
+        slug="fed-emergency-rate-cut-2026",
         outcome="Yes",
         event_type="fed_rate_cut_surprise",
         direction="up",
         shift_threshold=0.10,
-        label="Fed-5-cuts-surprise",
+        label="Fed-emergency-cut",
     ),
 
     # Russia / Ukraine
     MarketSpec(
-        slug="russia-x-ukraine-ceasefire-before-2027",
+        slug="ukraine-russia-ceasefire-by-end-of-2026",
         outcome="Yes",
         event_type="russia_ukraine_ceasefire",
         direction="up",
@@ -131,7 +131,7 @@ DEFAULT_WATCHLIST: List[MarketSpec] = [
 
     # China / Taiwan
     MarketSpec(
-        slug="will-china-invade-taiwan-before-2027",
+        slug="china-invades-taiwan-by-end-of-2026",
         outcome="Yes",
         event_type="china_taiwan_tension",
         direction="up",
@@ -139,9 +139,9 @@ DEFAULT_WATCHLIST: List[MarketSpec] = [
         label="China-Taiwan-invasion",
     ),
 
-    # Crypto-specific (macro stress)
+    # Crypto-specific
     MarketSpec(
-        slug="us-recession-by-end-of-2026",
+        slug="us-recession-in-2026",
         outcome="Yes",
         event_type="vix_spike_extreme",
         direction="up",
