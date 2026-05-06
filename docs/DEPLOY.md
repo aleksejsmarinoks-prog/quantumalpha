@@ -1,281 +1,196 @@
 # QuantumAlpha — Production Deployment Guide
 
-Target: **Hetzner CX22 VPS (Ubuntu 24.04, 2 vCPU, 4GB RAM, 40GB SSD)**
-Path: `/opt/qa_bot`
-Service: `systemd` user service
-
-This guide deploys `bot.main` from a fresh clone in **paper-mode**. Live trading and live Earn auto-mode are **opt-in** via env flags after manual verification.
+This is the **deployed reality** as of 2026-05-06. Earlier revisions of this document referenced `/opt/qa_bot`, user `qabot`, service `quantumalpha.service`, and Hetzner CX22 — none of those match the running system. If you find more drift, fix it here.
 
 ---
 
-## Prerequisites
+## 1. Host
 
-- Hetzner Cloud account, CX22 VPS provisioned
-- Domain (optional — only needed for HTTPS webhook, not used here since we use long-polling)
-- SSH key configured
+| | |
+|---|---|
+| Provider | Hetzner Cloud |
+| Plan | **CPX22** (2 vCPU AMD, 4 GB RAM, 40 GB NVMe) |
+| OS | Ubuntu 24.04 LTS |
+| Public IPv4 | `167.235.254.33` |
+| User | `qa` (unprivileged, member of `sudo`) |
+| App home | `/home/qa/quantumalpha` |
+| Python | `python3` → 3.12.3 (system) |
+| Virtualenv | `/home/qa/quantumalpha/venv` |
 
 ---
 
-## 1. Initial server setup (one-time)
+## 2. SSH access
 
 ```bash
-ssh root@YOUR_VPS_IP
-
-# Update + essential packages
-apt update && apt upgrade -y
-apt install -y python3.11 python3.11-venv python3-pip git ufw fail2ban
-
-# Lock down firewall — only SSH + maybe HTTPS for monitoring
-ufw allow 22/tcp
-ufw --force enable
-
-# Create unprivileged user for the bot
-adduser --disabled-password --gecos "" qabot
-usermod -aG sudo qabot
-
-# Switch to bot user
-su - qabot
+ssh qa@167.235.254.33
 ```
 
-## 2. Clone repo + setup venv
+Key-based auth only; password login is disabled. The `qa` user holds a deploy key registered on the GitHub repo for `git pull`. Do not use a personal key for git operations from the VPS.
 
-```bash
-cd ~
-git clone https://github.com/aleksejsmarinoks-prog/quantumalpha.git
-cd quantumalpha
+---
 
-python3.11 -m venv .venv
-source .venv/bin/activate
-pip install --upgrade pip
-pip install -r requirements.txt
-```
+## 3. Systemd unit
 
-If `requirements.txt` is missing aiohttp/apscheduler/aiogram, install them:
-
-```bash
-pip install aiogram>=3.15 apscheduler>=3.10 aiohttp python-dotenv
-```
-
-## 3. Configure environment
-
-```bash
-cp .env.example .env
-nano .env
-```
-
-Fill in at minimum:
-
-```
-TELEGRAM_TOKEN=YOUR_BOT_TOKEN_FROM_BOTFATHER
-ALLOWED_USER_ID=YOUR_TELEGRAM_USER_ID
-DATA_DIR=/home/qabot/quantumalpha/data
-STARTING_EQUITY_USD=1000
-LIVE_TRADING=false
-LIVE_EARN_MODE=false
-BYBIT_TESTNET=true
-```
-
-For initial deployment leave Bybit API keys EMPTY. The bot will run in paper-mode + public-endpoints-only mode and that's fully functional for the funding monitor baseline collection phase.
-
-```bash
-mkdir -p data
-chmod 700 .env data
-```
-
-## 4. Test run (interactive)
-
-Before installing as a service, verify the bot starts correctly:
-
-```bash
-source .venv/bin/activate
-python -m bot.main
-```
-
-You should see:
-
-```
-================================================
-QuantumAlpha bot starting
-  data_dir       = /home/qabot/quantumalpha/data
-  starting_eq    = $1,000.00
-  live_trading   = False
-  live_earn_mode = False
-  bybit_testnet  = True
-================================================
-INFO     PnL Ledger initialised at .../data/pnl.db
-INFO     RiskKernel initialised: equity=$1,000.00 ...
-INFO     FundingMonitor started: symbols=['BTCUSDT', 'ETHUSDT', 'SOLUSDT'] interval=300s
-INFO     Telegram polling started — bot is live
-```
-
-Test in Telegram by sending `/balance` — you should get a structured response with $1,000 equity and zero PnL.
-
-Stop with `Ctrl+C`. The bot will gracefully shut down.
-
-## 5. Install as systemd service
-
-Create `/etc/systemd/system/quantumalpha.service` (use `sudo`):
+Path: `/etc/systemd/system/qa-bot.service`. Current content (verbatim):
 
 ```ini
 [Unit]
-Description=QuantumAlpha trading bot
+Description=QuantumAlpha Trading Bot
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=qabot
-Group=qabot
-WorkingDirectory=/home/qabot/quantumalpha
-Environment="PATH=/home/qabot/quantumalpha/.venv/bin"
-EnvironmentFile=/home/qabot/quantumalpha/.env
-ExecStart=/home/qabot/quantumalpha/.venv/bin/python -m bot.main
-Restart=on-failure
-RestartSec=15s
-StandardOutput=append:/home/qabot/quantumalpha/logs/quantumalpha.log
-StandardError=append:/home/qabot/quantumalpha/logs/quantumalpha.err
-
-# Security hardening
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=read-only
-ReadWritePaths=/home/qabot/quantumalpha/data /home/qabot/quantumalpha/logs
+User=qa
+Group=qa
+WorkingDirectory=/home/qa/quantumalpha
+EnvironmentFile=/home/qa/quantumalpha/.env
+ExecStart=/home/qa/quantumalpha/venv/bin/python -m bot.main
+Restart=always
+RestartSec=10
+StandardOutput=append:/home/qa/quantumalpha/logs/qa.log
+StandardError=append:/home/qa/quantumalpha/logs/qa.log
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-Then:
+Key points: stdout and stderr both append to a single `qa.log` (no journald-only output, log file is the source of truth); `Restart=always` with 10s back-off; no security hardening directives are currently applied (room to add `NoNewPrivileges`, `ProtectSystem`, etc. — tracked separately).
 
-```bash
-mkdir -p /home/qabot/quantumalpha/logs
+---
 
-sudo systemctl daemon-reload
-sudo systemctl enable quantumalpha
-sudo systemctl start quantumalpha
+## 4. Environment variables
 
-# Check status
-sudo systemctl status quantumalpha
-journalctl -u quantumalpha -f
+Stored in `/home/qa/quantumalpha/.env` (mode `600`, owner `qa`). The systemd unit loads it via `EnvironmentFile=`. Names only — populate values from your password manager:
+
+```
+# Telegram
+TELEGRAM_BOT_TOKEN
+TELEGRAM_CHAT_ID
+ALLOWED_USER_ID
+
+# Bybit
+BYBIT_API_KEY
+BYBIT_API_SECRET
+BYBIT_TESTNET
+
+# Mode flags
+QA_MODE
+LIVE_TRADING
+QA_LIVE_EARN_MODE
+
+# Capital + risk
+QA_TOTAL_CAPITAL_USD
+RISK_PER_TRADE_PCT
+DAILY_DD_LIMIT_PCT
+WEEKLY_DD_LIMIT_PCT
+
+# Strategy toggles
+STRATEGY_FUNDING_ARB_ENABLED
+STRATEGY_BASIS_TRADE_ENABLED
+STRATEGY_MEAN_REVERSION_ENABLED
+
+# Macro alerts
+VIX_ALERT_THRESHOLD
+GOLD_MOVE_PCT_ALERT
+OIL_MOVE_PCT_ALERT
+
+# Reporting / scheduling
+EQUITY_TRACKER_SHEET_ID
+EQUITY_SNAPSHOT_INTERVAL_MIN
+PIPELINE_CRON
+
+# Misc
+ANTHROPIC_API_KEY
 ```
 
-## 6. Operations
+Never commit `.env`. `.env.example` in the repo is the template. Live trading and live-Earn must be opted into explicitly (`LIVE_TRADING=true`, `QA_LIVE_EARN_MODE=true`) — both default to false.
 
-### Restart after code update
+---
+
+## 5. Deployment workflow
+
+Routine code update:
 
 ```bash
+ssh qa@167.235.254.33
 cd ~/quantumalpha
 git pull
-sudo systemctl restart quantumalpha
+# only if requirements.txt changed:
+source venv/bin/activate && pip install -r requirements.txt
+sudo systemctl restart qa-bot.service
 ```
 
-### View logs
+Verify the restart took:
 
 ```bash
-# Live tail
-journalctl -u quantumalpha -f
-
-# Last 100 lines
-journalctl -u quantumalpha -n 100
-
-# Errors only
-journalctl -u quantumalpha -p err
-
-# Filter by date
-journalctl -u quantumalpha --since "1 hour ago"
+sudo systemctl status qa-bot.service --no-pager
+tail -n 50 ~/quantumalpha/logs/qa.log
 ```
 
-### SQLite inspection
+Look for the `QuantumAlpha bot starting` banner and `Telegram polling started — bot is live` within the first ~2 seconds.
+
+---
+
+## 6. Common ops
 
 ```bash
-sqlite3 ~/quantumalpha/data/pnl.db
-.tables
-.schema trade_fills
-SELECT COUNT(*) FROM trade_fills;
-.quit
+# Service control
+sudo systemctl status qa-bot.service
+sudo systemctl restart qa-bot.service
+sudo systemctl stop qa-bot.service
+sudo systemctl start qa-bot.service
 
-sqlite3 ~/quantumalpha/data/funding_history.db
-SELECT symbol, AVG(funding_rate)*100 AS mean_pct, COUNT(*) FROM funding_rate_history GROUP BY symbol;
-```
+# Live tail (file is authoritative)
+tail -f ~/quantumalpha/logs/qa.log
 
-### Manual halt via Telegram
+# journald view (also captures pre-ExecStart failures)
+journalctl -u qa-bot.service -n 200 --no-pager
+journalctl -u qa-bot.service -f
 
-```
-/halt 24 manual review
-```
+# Manual debug run (stop the service first to avoid double-polling Telegram)
+sudo systemctl stop qa-bot.service
+cd ~/quantumalpha && source venv/bin/activate && python -m bot.main
 
-### Backup data dir
-
-```bash
-tar -czf backup-$(date +%Y%m%d).tar.gz ~/quantumalpha/data ~/quantumalpha/.env
-```
-
-Set up weekly backup via cron:
-
-```cron
-0 4 * * 0 cd /home/qabot/quantumalpha && tar -czf /home/qabot/backups/qa-$(date +\%Y\%m\%d).tar.gz data .env
+# SQLite inspection (install once: sudo apt install -y sqlite3)
+sqlite3 ~/quantumalpha/data/pnl.db '.tables'
+sqlite3 ~/quantumalpha/data/pnl.db 'SELECT COUNT(*) FROM trade_fills;'
+sqlite3 ~/quantumalpha/data/funding.db 'SELECT symbol, COUNT(*) FROM funding_rate_history GROUP BY symbol;'
 ```
 
 ---
 
-## 7. Going live — transition criteria
+## 7. Logs
 
-The bot ships in **paper-mode**. Only enable `LIVE_TRADING=true` after ALL of these pass:
+Single combined file: `/home/qa/quantumalpha/logs/qa.log`. Both stdout and stderr from the systemd unit append here, plus everything Python's `logging` module emits.
+
+- No rotation is currently configured. The file is ~6 MB after one week — plan to add `logrotate` before it crosses ~100 MB.
+- For pre-`ExecStart` failures (env-file parse errors, venv missing) consult `journalctl -u qa-bot.service` instead — the file won't have them.
+
+---
+
+## 8. Going live — transition criteria
+
+The bot ships in paper-mode. Flip `LIVE_TRADING=true` only when **all** of these pass:
 
 | Criterion | Threshold | How to check |
 |---|---|---|
-| Funding history collected | ≥ 14 days | `SELECT COUNT(*) FROM funding_rate_history;` should be ≥ 4000 (3 symbols × 12 samples/h × 24h × 14d ≈ 12,000) |
-| DeepSeek Task #9 spec implemented | Done | thresholds calibrated against real distribution |
+| Funding history collected | ≥ 14 days | `SELECT COUNT(*) FROM funding_rate_history;` ≥ ~12,000 (3 symbols × 12/h × 24h × 14d) |
 | Paper trades executed | ≥ 30 | `SELECT COUNT(*) FROM trade_fills WHERE is_paper = 1;` |
-| Paper Sharpe ratio | ≥ 1.5 over 30 days | manual analysis |
+| Paper Sharpe (30d rolling) | ≥ 1.5 | manual analysis from `equity_snapshots` |
 | Max paper drawdown | ≤ 8% | manual analysis |
-| Bybit API keys tested on testnet | All endpoints work | manual verification |
+| Bybit testnet end-to-end | All endpoints OK | manual verification with `BYBIT_TESTNET=true` |
 
-Once these pass:
-
-1. Stop service: `sudo systemctl stop quantumalpha`
-2. Edit `.env`: set `BYBIT_API_KEY`, `BYBIT_API_SECRET`, `BYBIT_TESTNET=false`, `LIVE_TRADING=true`
-3. Restart: `sudo systemctl start quantumalpha`
-4. Watch first 10 trades carefully via Telegram + journalctl
-
-Same procedure for `LIVE_EARN_MODE=true` after testing on a small amount ($10) first.
-
----
-
-## 8. Monitoring
-
-The bot self-reports via Telegram. Recommended alerts:
-
-- `/risk_status` daily — verify halt status, equity, DD
-- `/balance` weekly — Earn yield + active trading PnL summary
-- `/funding` ad-hoc — current rates + 7d stats
-
-Set `journalctl` errors to email yourself if running unattended:
+Procedure:
 
 ```bash
-# Add to ~/.config/systemd/user/
-# Or use external monitoring like Grafana + Promtail + Loki for production
+sudo systemctl stop qa-bot.service
+nano ~/quantumalpha/.env  # set BYBIT_API_KEY, BYBIT_API_SECRET, BYBIT_TESTNET=false, LIVE_TRADING=true
+sudo systemctl start qa-bot.service
+tail -f ~/quantumalpha/logs/qa.log  # watch first ~10 trades closely
 ```
 
----
-
-## Troubleshooting
-
-**Bot can't connect to Telegram**
-→ Check TELEGRAM_TOKEN spelling. Test manually: `curl https://api.telegram.org/bot$TELEGRAM_TOKEN/getMe`
-
-**Funding monitor returns no data**
-→ Bybit may have rate-limited. Check `journalctl -u quantumalpha -p warning`. Public endpoints are 50 req/sec, should never throttle at 5-min poll.
-
-**`/balance` shows $0**
-→ STARTING_EQUITY_USD not set. Restart after editing .env.
-
-**SQLite locked errors**
-→ WAL mode is enabled, but ensure no other process accesses the same DB files. Don't run two bots against same DATA_DIR.
-
-**Out of memory on CX22**
-→ 4GB is enough for current scope. If it grows: upgrade to CX32 ($8/mo more) or add a swap file.
+Same procedure for `QA_LIVE_EARN_MODE=true`, ideally first on a small ($10) Earn balance.
 
 ---
 
@@ -283,22 +198,18 @@ Set `journalctl` errors to email yourself if running unattended:
 
 Daily snapshot of the SQLite databases, `.env`, and the tail of `qa.log`. Phase B (off-site rotation to Hetzner Storage Box) is planned but not yet wired up.
 
-**Script:** `scripts/backup.sh`
-**Destination:** `/home/qa/backups/qa-backup-YYYYMMDD-HHMM.tar.gz` (mode 600, dir mode 700)
-**Includes:**
-- `data/funding.db`, `data/pnl.db`
-- `.env`
-- Last 1000 lines of `logs/qa.log`
-
-**Retention:** keep newest 7, delete older.
-**Audit log:** `/home/qa/backups/backup.log` (append-only).
-**Cron:** daily 03:00 UTC, installed via the `qa` user crontab:
+- **Script:** `scripts/backup.sh`
+- **Destination:** `/home/qa/backups/qa-backup-YYYYMMDD-HHMM.tar.gz` (mode `600`, dir mode `700`)
+- **Includes:** `data/funding.db`, `data/pnl.db`, `.env`, last 1000 lines of `logs/qa.log`
+- **Retention:** keep newest 7, delete older
+- **Audit log:** `/home/qa/backups/backup.log` (append-only)
+- **Cron:** daily 03:00 UTC, installed in the `qa` user crontab:
 
 ```cron
 0 3 * * * /home/qa/quantumalpha/scripts/backup.sh >> /home/qa/backups/backup.log 2>&1
 ```
 
-Verify with `crontab -l`. Test manually: `/home/qa/quantumalpha/scripts/backup.sh && ls -lh /home/qa/backups/`.
+Verify with `crontab -l`. Manual run: `/home/qa/quantumalpha/scripts/backup.sh && ls -lh /home/qa/backups/`.
 
 ### Phase B — off-site (planned, not implemented)
 
@@ -306,3 +217,17 @@ Verify with `crontab -l`. Test manually: `/home/qa/quantumalpha/scripts/backup.s
 - `rclone` over SFTP or WebDAV
 - Rotation: 30 daily / 12 weekly / 12 monthly
 - At-rest encryption with `age` or `gpg` before upload
+
+---
+
+## 10. Troubleshooting
+
+**Bot can't connect to Telegram.** Check `TELEGRAM_BOT_TOKEN`. Sanity check: `curl https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/getMe` (run from a host with the same key).
+
+**`portfolio_sync failed: Auth required but BYBIT_API_KEY/BYBIT_API_SECRET not set`.** Expected when running keyless in paper-mode; the scheduler job should short-circuit instead of throwing — tracked as a known issue.
+
+**`'BybitClient' object has no attribute 'get_klines'` every 5 min.** Method missing on the client; kline-dependent strategies (e.g. `cvd_divergence`) silently degrade. Add `get_klines` to `bot/core/bybit_client.py`.
+
+**SQLite `database is locked`.** WAL mode is enabled — symptom usually means a second process is accessing the same DB. Don't run two bots against `~/quantumalpha/data` (e.g. don't leave a manual debug run going while the service is up).
+
+**Out of memory.** 4 GB CPX22 is comfortable for current scope. If it tightens, upgrade plan or add a 2 GB swap file before rewriting code.
