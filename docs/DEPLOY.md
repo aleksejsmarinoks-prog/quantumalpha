@@ -276,3 +276,33 @@ Set `journalctl` errors to email yourself if running unattended:
 
 **Out of memory on CX22**
 → 4GB is enough for current scope. If it grows: upgrade to CX32 ($8/mo more) or add a swap file.
+
+---
+
+## 9. Automated backups (Phase A — local)
+
+Daily snapshot of the SQLite databases, `.env`, and the tail of `qa.log`. Phase B (off-site rotation to Hetzner Storage Box) is planned but not yet wired up.
+
+**Script:** `scripts/backup.sh`
+**Destination:** `/home/qa/backups/qa-backup-YYYYMMDD-HHMM.tar.gz` (mode 600, dir mode 700)
+**Includes:**
+- `data/funding.db`, `data/pnl.db`
+- `.env`
+- Last 1000 lines of `logs/qa.log`
+
+**Retention:** keep newest 7, delete older.
+**Audit log:** `/home/qa/backups/backup.log` (append-only).
+**Cron:** daily 03:00 UTC, installed via the `qa` user crontab:
+
+```cron
+0 3 * * * /home/qa/quantumalpha/scripts/backup.sh >> /home/qa/backups/backup.log 2>&1
+```
+
+Verify with `crontab -l`. Test manually: `/home/qa/quantumalpha/scripts/backup.sh && ls -lh /home/qa/backups/`.
+
+### Phase B — off-site (planned, not implemented)
+
+- Hetzner Storage Box subscription (~€4/mo)
+- `rclone` over SFTP or WebDAV
+- Rotation: 30 daily / 12 weekly / 12 monthly
+- At-rest encryption with `age` or `gpg` before upload
