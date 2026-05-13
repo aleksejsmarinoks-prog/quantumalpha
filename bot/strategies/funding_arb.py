@@ -445,6 +445,9 @@ class FundingArbStrategy:
             spot_ticker = await client.fetch_ticker(spot_symbol, category="spot")
         except Exception as e:
             log.error(f"Failed to fetch prices for {symbol} arb: {e}")
+            # Phase 7.2 — telemetry marker
+            _result_label = locals().get('cycle_result', 'unknown') if isinstance(locals().get('cycle_result'), str) else 'hold'
+            log.info("[EVAL_TICK] strategy=funding_arb_v1 result=%s", _result_label)
             return None
 
         # Quantity from notional
@@ -589,6 +592,7 @@ class FundingArbStrategy:
         client:        BybitClient,
         funding_rates: list[FundingRate],
     ):
+        log.info("[EVAL_TICK] strategy=funding_arb_v1 cycle_start")
         """
         Single evaluation cycle. Called periodically by scheduler.
 

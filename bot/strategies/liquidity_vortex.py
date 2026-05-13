@@ -831,6 +831,9 @@ class LiquidityVortexStrategy:
             return
         if self.client is None:
             self.open_positions.pop(pos.symbol, None)
+            # Phase 7.2 — telemetry marker
+            _result_label = locals().get('verdict', 'hold') if isinstance(locals().get('verdict'), str) else 'hold'
+            log.info("[EVAL_TICK] strategy=liquidity_vortex_v1 symbols=%s result=%s", ",".join(self.symbols) if hasattr(self, "symbols") else "?", _result_label)
             return
         side = "sell" if pos.signal.direction == Direction.LONG else "buy"
         try:
@@ -848,6 +851,7 @@ class LiquidityVortexStrategy:
 
     # ── Top-level loop entry point (used by orchestra/scheduler) ─────────
     async def run_one_cycle(self) -> dict:
+        log.info("[EVAL_TICK] strategy=liquidity_vortex_v1 cycle_start")
         """One pass over all symbols: manage existing + try to open new."""
         report: dict[str, Any] = {"opened": [], "managed": [], "rejected": []}
 

@@ -211,6 +211,13 @@ def build_scheduler(
     _digest_hour = int(_digest_os.getenv("DAILY_DIGEST_UTC_HOUR", "8"))
     _digest_minute = int(_digest_os.getenv("DAILY_DIGEST_UTC_MINUTE", "0"))
 
+    def _resolve_status(strat) -> str:
+        """Phase 7.2 — prefer get_status_dict() (PAPER) over .status (DISABLED)."""
+        try:
+            return strat.get_status_dict().get("status", "unknown")
+        except Exception:
+            return getattr(strat, "status", "unknown")
+
     def _state_snapshot_for_digest() -> dict:
         try:
             uptime_sec = int(_digest_time.time() - _BOT_START_TS)
@@ -232,7 +239,7 @@ def build_scheduler(
                 if orchestra is not None:
                     for sid, strat in orchestra._strategies.items():
                         strategies[sid] = {
-                            "status": getattr(strat, "status", "unknown"),
+                            "status": _resolve_status(strat),
                             "signal_count": getattr(strat, "signal_count", 0),
                             "pnl_24h": getattr(strat, "pnl_24h", 0.0),
                         }
@@ -305,6 +312,39 @@ def build_scheduler(
     logger.info("daily_digest scheduled at %02d:%02d UTC daily",
                 _digest_hour, _digest_minute)
     # ─── End Phase 7.1 ───
+
+
+    # ---- Phase 7.2 equity snapshot (Issue 2) ----
+    async def _equity_snapshot_v72() -> None:
+        try:
+            import os
+            from bot.core._equity_db_helper import insert_equity_snapshot
+            equity_now = 1000.0
+            open_pos = 0
+            if orchestra is not None:
+                try: equity_now = float(orchestra.get_total_equity())
+                except Exception: pass
+                try: open_pos = int(orchestra.count_open_positions())
+                except Exception: pass
+            insert_equity_snapshot(
+                db_path=os.getenv("EQUITY_DB_PATH", "data/equity.db"),
+                snapshot_utc=datetime.now(timezone.utc).isoformat(),
+                equity=equity_now,
+                open_positions=open_pos,
+            )
+        except Exception as e:
+            logger.exception("equity_snapshot_v72 failed: %s", e)
+
+    sched.add_job(
+        _equity_snapshot_v72,
+        trigger="cron",
+        minute=0,
+        id="equity_snapshot_v72",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+    logger.info("equity_snapshot_v72 scheduled hourly (Phase 7.2)")
 
     return sched
 
