@@ -80,3 +80,13 @@ nosetests.xml
 coverage.xml
 *.cover
 *.py,cover
+
+# Phase 6+7 additions
+*.bak
+*.bak.*
+__pycache__/
+*.pyc
+backtest_results/
+data/backtest_cache/
+data/*.db
+logs/

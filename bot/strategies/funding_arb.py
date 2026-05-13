@@ -204,6 +204,51 @@ class ArbPosition:
 # =============================================================================
 
 class FundingArbStrategy:
+    def get_universe(self) -> list[str]:
+        """Symbols this strategy operates on (orchestra interface)."""
+        return sorted(ALLOWED_SYMBOLS)
+
+    def get_status_dict(self) -> dict:
+        """Status snapshot for /strategies Telegram command (orchestra interface)."""
+        status = "LIVE" if self.live_trading else "PAPER"
+        capital_approx = (self.leg_size_usd * 2) / max(self.risk_kernel.current_equity, 1.0)
+        return {
+            "status": status,
+            "daily_pnl_usd": 0.0,
+            "active_positions": len(self._open_arbs),
+            "capital_pct": min(capital_approx, 1.0),
+            "signals_emitted": 0,
+            "signals_gated": 0,
+        }
+
+    @property
+    def config(self):
+        """Orchestra interface — mimics StrategyConfig minimal contract."""
+        from types import SimpleNamespace
+        capital_approx = (self.leg_size_usd * 2) / max(self.risk_kernel.current_equity, 1.0)
+        return SimpleNamespace(
+            strategy_id="funding_arb_v1",
+            capital_pct=min(capital_approx, 1.0),
+            enabled=True,
+        )
+
+    @property
+    def status(self):
+        """Orchestra interface — DISABLED so orchestra.run_tick skips this strategy.
+        FundingArb has its own scheduler job (funding_arb_eval), should not be
+        double-evaluated via orchestra tick. /strategies display uses
+        get_status_dict() which returns PAPER independently."""
+        from bot.strategies.base_strategy import StrategyStatus
+        return StrategyStatus.DISABLED
+
+    def set_status(self, new_status):
+        """No-op — FundingArb manages own state, ignore orchestra status changes."""
+        pass
+
+    def get_strategy_id(self) -> str:
+        """Required by Orchestra.register() — returns unique strategy ID."""
+        return getattr(self, "NAME", "funding_arb_v1")
+
     """
     Delta-neutral funding rate arbitrage.
 

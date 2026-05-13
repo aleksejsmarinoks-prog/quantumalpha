@@ -200,6 +200,112 @@ def build_scheduler(
             coalesce=True,
         )
 
+
+    # ─── Phase 7.1: QA Sentinel L1 (Daily Digest) ───
+    import os as _digest_os
+    import time as _digest_time
+    from datetime import datetime as _digest_dt, timezone as _digest_tz, timedelta as _digest_td
+    from bot.daily_digest import DailyDigestGenerator
+
+    _BOT_START_TS = _digest_time.time()
+    _digest_hour = int(_digest_os.getenv("DAILY_DIGEST_UTC_HOUR", "8"))
+    _digest_minute = int(_digest_os.getenv("DAILY_DIGEST_UTC_MINUTE", "0"))
+
+    def _state_snapshot_for_digest() -> dict:
+        try:
+            uptime_sec = int(_digest_time.time() - _BOT_START_TS)
+            memory_mb = None
+            try:
+                import psutil
+                memory_mb = psutil.Process().memory_info().rss / (1024 * 1024)
+            except ImportError:
+                try:
+                    with open("/proc/self/status") as f:
+                        for line in f:
+                            if line.startswith("VmRSS:"):
+                                memory_mb = float(line.split()[1]) / 1024
+                                break
+                except OSError:
+                    pass
+            strategies = {}
+            try:
+                if orchestra is not None:
+                    for sid, strat in orchestra._strategies.items():
+                        strategies[sid] = {
+                            "status": getattr(strat, "status", "unknown"),
+                            "signal_count": getattr(strat, "signal_count", 0),
+                            "pnl_24h": getattr(strat, "pnl_24h", 0.0),
+                        }
+            except Exception:
+                pass
+            return {
+                "uptime_sec": uptime_sec,
+                "memory_mb": memory_mb,
+                "restart_count": 0,
+                "provider_healthy": True,
+                "open_positions": 0,
+                "strategies": strategies,
+            }
+        except Exception as e:
+            logger.warning("digest state snapshot failed: %s", e)
+            return {}
+
+    def _calendar_for_digest() -> list:
+        try:
+            from bot.utils.calendar_events import events_in_range
+            now = _digest_dt.now(_digest_tz.utc)
+            return events_in_range(now, now + _digest_td(hours=24))
+        except (ImportError, AttributeError):
+            return []
+        except Exception as e:
+            logger.warning("digest calendar gather failed: %s", e)
+            return []
+
+    async def _run_daily_digest() -> None:
+        api_key = _digest_os.getenv("ANTHROPIC_API_KEY")
+        chat_id = _digest_os.getenv("TELEGRAM_CHAT_ID")
+        if not api_key or not chat_id:
+            logger.warning("daily_digest: missing API key or chat ID — skipping")
+            return
+        try:
+            from pathlib import Path as _DP
+            generator = DailyDigestGenerator(
+                anthropic_api_key=api_key,
+                logs_path=_DP(_digest_os.getenv("QA_LOG_PATH", "logs/qa.log")),
+                equity_db_path=_DP(_digest_os.getenv("EQUITY_DB_PATH", "data/equity.db")),
+                funding_db_path=_DP(_digest_os.getenv("FUNDING_DB_PATH", "data/funding.db")),
+                bot_state_provider=_state_snapshot_for_digest,
+                calendar_provider=_calendar_for_digest,
+                include_trade_trigger=True,
+            )
+            digest_text = await generator.generate_digest()
+            if bot and chat_id:
+                await bot.send_message(
+                    chat_id=int(chat_id),
+                    text=digest_text,
+                    parse_mode="Markdown",
+                    disable_notification=False,
+                )
+                logger.info("daily_digest: posted to chat %s (%d chars)",
+                            chat_id, len(digest_text))
+        except Exception as e:
+            logger.exception("daily_digest: failed: %s", e)
+
+    sched.add_job(
+        _run_daily_digest,
+        trigger="cron",
+        hour=_digest_hour,
+        minute=_digest_minute,
+        timezone="UTC",
+        id="daily_digest",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+    logger.info("daily_digest scheduled at %02d:%02d UTC daily",
+                _digest_hour, _digest_minute)
+    # ─── End Phase 7.1 ───
+
     return sched
 
 

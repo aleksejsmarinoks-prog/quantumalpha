@@ -1,0 +1,433 @@
+"""
+QA Daily Digest — Data Aggregator
+====================================
+
+Pure functions for 24h data collection. Designed for testability:
+  - Take paths/callables, no global state
+  - Return plain dicts (JSON-serializable)
+  - Defensive: missing DB/log/table → empty dict, never raise
+  - Read-only SQLite (PRAGMA query_only = ON)
+
+All times are UTC. All windows respect `window_hours` parameter.
+
+Author: QuantumAlpha
+Version: 7.1.0
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+import sqlite3
+import statistics
+from contextlib import contextmanager
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from typing import Callable, Dict, Iterator, List, Optional
+
+logger = logging.getLogger("qa.daily_digest")
+
+
+# ---------------------------------------------------------------------------
+# Common SQLite helpers (read-only)
+# ---------------------------------------------------------------------------
+
+@contextmanager
+def _readonly_conn(db_path: Path) -> Iterator[Optional[sqlite3.Connection]]:
+    """Open SQLite in read-only mode. Yields None if file missing/unreadable."""
+    if not db_path.exists():
+        logger.warning("DB not found, skipping: %s", db_path)
+        yield None
+        return
+    conn: Optional[sqlite3.Connection] = None
+    try:
+        # URI mode + mode=ro enforces read-only at SQLite level
+        uri = f"file:{db_path}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=5.0)
+        conn.row_factory = sqlite3.Row
+        # Belt and suspenders: query_only pragma prevents accidental writes
+        try:
+            conn.execute("PRAGMA query_only = ON")
+        except sqlite3.DatabaseError:
+            pass
+        yield conn
+    except sqlite3.DatabaseError as e:
+        logger.warning("DB open failed (%s): %s", db_path, e)
+        yield None
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ? LIMIT 1",
+        (name,),
+    ).fetchone()
+    return row is not None
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+# ---------------------------------------------------------------------------
+# Log file aggregation
+# ---------------------------------------------------------------------------
+
+# Pattern matchers for known log lines. Order matters — more specific first.
+_LOG_PATTERNS: Dict[str, re.Pattern] = {
+    "trades_opened":   re.compile(r"\b(trade opened|order filled|position opened|opened position)\b", re.I),
+    "trades_closed":   re.compile(r"\b(trade closed|position closed|closed position|exit filled)\b", re.I),
+    "errors":          re.compile(r"\bERROR\b"),
+    "warnings":        re.compile(r"\bWARNING\b"),
+    "scheduler_runs":  re.compile(r"\b(scheduler|cron|tick|cycle)\b.*\b(start|fired|completed|done)\b", re.I),
+    "telegram_reconnects": re.compile(r"\bServerDisconnectedError\b|\b(telegram).*reconnect", re.I),
+    "lv1_evals":       re.compile(r"\b(liquidity_vortex|LV1)\b.*\b(eval|tick)", re.I),
+    "funding_cycles":  re.compile(r"\bfunding_arb\b.*\b(cycle|evaluate)", re.I),
+    "mean_rev_signals": re.compile(r"\bmean_reversion\b.*\b(signal|tick)", re.I),
+    "dxy_missing":     re.compile(r"\bDX-Y\.NYB\b|\bDXY\b.*\b(missing|unavailable|fail)", re.I),
+    "vix_missing":     re.compile(r"\b\^?VIX\b.*\b(missing|unavailable|fail)", re.I),
+}
+
+# Log line timestamp parser. Typical format: "YYYY-MM-DD HH:MM:SS,mmm"
+_LOG_TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})")
+
+
+def _parse_log_timestamp(line: str) -> Optional[datetime]:
+    m = _LOG_TS_RE.match(line)
+    if not m:
+        return None
+    try:
+        ts = datetime.fromisoformat(m.group(1).replace(" ", "T"))
+        # Assume logs in UTC (project standard)
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return ts
+    except ValueError:
+        return None
+
+
+def aggregate_log_events(
+    logs_path: Path,
+    window_hours: int = 24,
+    now: Optional[datetime] = None,
+    max_bytes: int = 50 * 1024 * 1024,   # 50MB cap — avoid reading enormous old logs
+) -> Dict[str, int]:
+    """Tail the log file and count matched patterns within window.
+
+    Returns dict with counts for each pattern in _LOG_PATTERNS, plus
+    `total_lines_scanned`. Missing file → all zeros.
+    """
+    counts: Dict[str, int] = {k: 0 for k in _LOG_PATTERNS}
+    counts["total_lines_scanned"] = 0
+
+    if not logs_path.exists():
+        logger.info("Log file not found: %s", logs_path)
+        return counts
+
+    cutoff = (now or _utc_now()) - timedelta(hours=window_hours)
+
+    try:
+        # If file is huge, seek to end - max_bytes (still ~last day worth at reasonable rate)
+        file_size = logs_path.stat().st_size
+        seek_from = max(0, file_size - max_bytes)
+        with logs_path.open("r", encoding="utf-8", errors="replace") as f:
+            if seek_from > 0:
+                f.seek(seek_from)
+                f.readline()  # discard partial line
+            for line in f:
+                counts["total_lines_scanned"] += 1
+                ts = _parse_log_timestamp(line)
+                if ts is not None and ts < cutoff:
+                    continue  # outside window
+                for name, pattern in _LOG_PATTERNS.items():
+                    if pattern.search(line):
+                        counts[name] += 1
+    except OSError as e:
+        logger.warning("Log read failed (%s): %s", logs_path, e)
+
+    return counts
+
+
+# ---------------------------------------------------------------------------
+# Equity DB aggregation
+# ---------------------------------------------------------------------------
+
+# Try multiple table/column conventions — schema may have evolved across phases.
+_EQUITY_TABLE_CANDIDATES = (
+    "equity_snapshots", "equity_history", "snapshots", "equity",
+)
+_EQUITY_COL_VALUE = ("equity", "value", "balance", "total")
+_EQUITY_COL_TIME = ("snapshot_utc", "timestamp_utc", "fetched_utc", "ts", "timestamp")
+
+
+def aggregate_equity_changes(
+    db_path: Path,
+    window_hours: int = 24,
+    now: Optional[datetime] = None,
+) -> Dict[str, Optional[float]]:
+    """Return {start, end, delta, delta_pct, max_dd_pct, snapshot_count}.
+
+    All values None if data unavailable.
+    """
+    empty: Dict[str, Optional[float]] = {
+        "start": None, "end": None, "delta": None, "delta_pct": None,
+        "max_dd_pct": None, "snapshot_count": 0.0,
+    }
+    cutoff = (now or _utc_now()) - timedelta(hours=window_hours)
+    cutoff_iso = cutoff.isoformat()
+
+    with _readonly_conn(db_path) as conn:
+        if conn is None:
+            return empty
+
+        # Find a usable table
+        table: Optional[str] = None
+        value_col: Optional[str] = None
+        time_col: Optional[str] = None
+        for t in _EQUITY_TABLE_CANDIDATES:
+            if not _table_exists(conn, t):
+                continue
+            try:
+                cols = {row["name"] for row in conn.execute(f"PRAGMA table_info({t})")}
+            except sqlite3.DatabaseError:
+                continue
+            v = next((c for c in _EQUITY_COL_VALUE if c in cols), None)
+            ts = next((c for c in _EQUITY_COL_TIME if c in cols), None)
+            if v and ts:
+                table, value_col, time_col = t, v, ts
+                break
+
+        if not table:
+            logger.info("No equity table found in %s", db_path)
+            return empty
+
+        try:
+            rows = conn.execute(
+                f"SELECT {value_col} AS v, {time_col} AS t "
+                f"FROM {table} WHERE {time_col} >= ? ORDER BY {time_col} ASC",
+                (cutoff_iso,),
+            ).fetchall()
+        except sqlite3.DatabaseError as e:
+            logger.warning("Equity query failed: %s", e)
+            return empty
+
+    if not rows:
+        return empty
+
+    values: List[float] = [float(r["v"]) for r in rows if r["v"] is not None]
+    if not values:
+        return empty
+
+    start_val: float = values[0]
+    end_val: float = values[-1]
+    delta_val: float = end_val - start_val
+    delta_pct_val: float = (delta_val / start_val * 100.0) if start_val > 0 else 0.0
+
+    # Max drawdown over the window
+    peak: float = values[0]
+    max_dd_pct: float = 0.0
+    for snap_val in values:
+        if snap_val > peak:
+            peak = snap_val
+        if peak > 0:
+            dd = (peak - snap_val) / peak * 100.0
+            if dd > max_dd_pct:
+                max_dd_pct = dd
+
+    return {
+        "start": round(start_val, 2),
+        "end": round(end_val, 2),
+        "delta": round(delta_val, 2),
+        "delta_pct": round(delta_pct_val, 4),
+        "max_dd_pct": round(max_dd_pct, 4),
+        "snapshot_count": float(len(values)),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Funding rates DB aggregation
+# ---------------------------------------------------------------------------
+
+_FUNDING_TABLE_CANDIDATES = ("funding_rate_history", "funding_rates", "funding")
+
+
+def aggregate_funding_rates(
+    db_path: Path,
+    window_hours: int = 24,
+    now: Optional[datetime] = None,
+) -> Dict[str, Dict[str, float]]:
+    """Per-symbol: {current, median_24h, count}. Empty dict if data unavailable."""
+    result: Dict[str, Dict[str, float]] = {}
+    cutoff = (now or _utc_now()) - timedelta(hours=window_hours)
+    cutoff_iso = cutoff.isoformat()
+
+    with _readonly_conn(db_path) as conn:
+        if conn is None:
+            return result
+
+        table = next((t for t in _FUNDING_TABLE_CANDIDATES if _table_exists(conn, t)), None)
+        if not table:
+            return result
+
+        try:
+            rows = conn.execute(
+                f"SELECT symbol, funding_rate, fetched_utc "
+                f"FROM {table} "
+                f"WHERE fetched_utc >= ? "
+                f"ORDER BY fetched_utc ASC",
+                (cutoff_iso,),
+            ).fetchall()
+        except sqlite3.DatabaseError as e:
+            logger.warning("Funding query failed: %s", e)
+            return result
+
+    by_symbol: Dict[str, List[float]] = {}
+    for r in rows:
+        sym = r["symbol"]
+        try:
+            rate = float(r["funding_rate"])
+        except (TypeError, ValueError):
+            continue
+        by_symbol.setdefault(sym, []).append(rate)
+
+    for sym, rates in by_symbol.items():
+        if not rates:
+            continue
+        result[sym] = {
+            "current": round(rates[-1], 6),
+            "median_24h": round(statistics.median(rates), 6),
+            "count": len(rates),
+        }
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Calendar gathering (via provider callable)
+# ---------------------------------------------------------------------------
+
+def gather_calendar_today(
+    calendar_provider: Optional[Callable[[], List[dict]]],
+    window_hours: int = 24,
+    now: Optional[datetime] = None,
+) -> List[dict]:
+    """Filter calendar events to those in [now, now+window_hours].
+
+    `calendar_provider` is expected to return a list of dicts with keys:
+      time_utc: datetime | iso string
+      name: str
+      importance: str (optional)
+
+    Returns sorted list. None provider → empty list. Provider raise → empty list.
+    """
+    if calendar_provider is None:
+        return []
+    try:
+        events = calendar_provider() or []
+    except Exception as e:
+        logger.warning("calendar_provider raised: %s", e)
+        return []
+
+    anchor = now or _utc_now()
+    cutoff = anchor + timedelta(hours=window_hours)
+    out: List[dict] = []
+
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        t = ev.get("time_utc")
+        # Normalize to datetime
+        if isinstance(t, str):
+            try:
+                t = datetime.fromisoformat(t.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+        if not isinstance(t, datetime):
+            continue
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=timezone.utc)
+        if anchor <= t <= cutoff:
+            out.append({
+                "time_utc": t.isoformat(),
+                "name": str(ev.get("name", "Unknown")),
+                "importance": str(ev.get("importance", "medium")),
+            })
+
+    out.sort(key=lambda x: x["time_utc"])
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Bot health gathering (via provider callable)
+# ---------------------------------------------------------------------------
+
+def gather_bot_health(
+    state_provider: Optional[Callable[[], dict]],
+) -> Dict[str, object]:
+    """Provider returns whatever it knows. We normalize to expected keys.
+
+    Expected keys (all optional):
+      uptime_sec: int
+      memory_mb: float
+      restart_count: int
+      provider_healthy: bool
+      open_positions: int
+      strategies: dict[name, {pnl_24h, signal_count, status, ...}]
+    """
+    default: Dict[str, object] = {
+        "uptime_sec": None,
+        "memory_mb": None,
+        "restart_count": None,
+        "provider_healthy": None,
+        "open_positions": None,
+        "strategies": {},
+    }
+    if state_provider is None:
+        return default
+    try:
+        raw = state_provider() or {}
+    except Exception as e:
+        logger.warning("state_provider raised: %s", e)
+        return default
+
+    if not isinstance(raw, dict):
+        return default
+
+    result: Dict[str, object] = {
+        "uptime_sec": raw.get("uptime_sec"),
+        "memory_mb": raw.get("memory_mb"),
+        "restart_count": raw.get("restart_count"),
+        "provider_healthy": raw.get("provider_healthy"),
+        "open_positions": raw.get("open_positions"),
+        "strategies": raw.get("strategies") or {},
+    }
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Trade Trigger service health (optional — via systemctl probe)
+# ---------------------------------------------------------------------------
+
+def gather_trade_trigger_status() -> Dict[str, object]:
+    """Probe qa-trade-trigger.service via systemctl. Best-effort; returns
+    {"available": bool, "active": bool, "error": str|None}.
+    """
+    import subprocess
+    info: Dict[str, object] = {"available": False, "active": False, "error": None}
+    try:
+        # is-active returns 0 if active, non-zero otherwise (but doesn't fail catastrophically)
+        result = subprocess.run(
+            ["systemctl", "is-active", "qa-trade-trigger.service"],
+            capture_output=True, text=True, timeout=3.0,
+        )
+        info["available"] = True
+        status = result.stdout.strip()
+        info["active"] = (status == "active")
+        info["status"] = status
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+        info["error"] = f"{type(e).__name__}: {e}"
+    return info

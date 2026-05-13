@@ -337,6 +337,11 @@ class RiskKernel:
         log.warning(f"MANUAL HALT activated: {reason} ({hours}h)")
         self._save_state()
 
+    def is_trading_allowed(self) -> bool:
+        """Returns True if RiskKernel allows new trades (no active killswitch)."""
+        is_halted, _ = self._check_killswitch_active()
+        return not is_halted
+
     def manual_resume(self):
         """User-triggered resume (only valid if halt is manual)."""
         if self._halt_reason != HaltReason.MANUAL:

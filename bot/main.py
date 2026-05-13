@@ -42,6 +42,8 @@ from bot.handlers.strategy_commands import register_strategy_handlers
 from bot.strategies.cvd_divergence import CVDDivergenceStrategy
 from bot.strategies.dca_dips import DCADipsStrategy
 from bot.strategies.mean_reversion import MeanReversionStrategy
+from bot.strategies.liquidity_vortex import LiquidityVortexStrategy
+from bot.utils.market_state_provider import MarketStateProvider
 from bot.strategies.orchestra import OrchestraConfig, StrategyOrchestra
 
 
@@ -136,11 +138,50 @@ async def main() -> None:
         enabled=True,
     )
 
+    # LV1 — Liquidity Vortex (Phase 6.1, dormant until market_state_provider wired)
+    lv1_enabled = _env_bool("LV1_ENABLED", False)
+    lv1_live = _env_bool("LV1_LIVE_TRADING", False)
+    lv1_capital_pct = _env_float("LV1_CAPITAL_PCT", 0.10)
+
+    lv1 = LiquidityVortexStrategy(
+        bybit_client=bybit,
+        ledger=pnl_ledger,
+        risk_kernel=risk_kernel,
+        qa_provider=None,
+        market_state_provider=None,
+        capital_pct=lv1_capital_pct,
+        enabled=lv1_enabled,
+        live_trading=lv1_live,
+        symbols=("ETH/USDT:USDT", "SOL/USDT:USDT"),
+    )
+
+    # ──────────────────────────────────────────────────────────────────
+    # Phase 6.2 — MarketStateProvider for LV1
+    # Spin up only when LV1 is enabled (saves ~5MB + WS connections)
+    # ──────────────────────────────────────────────────────────────────
+    market_provider: MarketStateProvider | None = None
+    if lv1_enabled:
+        market_provider = MarketStateProvider(
+            symbols=("ETH/USDT:USDT", "SOL/USDT:USDT"),
+            reference_symbols=("BTC/USDT:USDT",),
+            exchange_name="bybit",
+            stale_threshold_sec=30,
+            warmup_timeout_sec=30.0,
+        )
+        await market_provider.start()
+        lv1.market_state_provider = market_provider
+        logger.info(
+            "MarketStateProvider live for LV1: %d symbols cached",
+            len(market_provider._cache),
+        )
+    else:
+        logger.info("LV1 disabled — MarketStateProvider not started")
+
     # ---- 7. Orchestra ----
     orchestra_config = OrchestraConfig(
         total_capital_usd=total_capital,
         paper_mode=paper_mode,
-        enabled_strategies=["funding_arb_v1", "mean_reversion_v1", "dca_dips_v1"],
+        enabled_strategies=["funding_arb_v1", "mean_reversion_v1", "dca_dips_v1", "liquidity_vortex_v1"],
         max_total_drawdown_pct=0.10,
         max_per_symbol_position_pct=0.20,
     )
@@ -153,6 +194,10 @@ async def main() -> None:
     orchestra.register(mean_rev)
     orchestra.register(cvd_div)
     orchestra.register(dca_dips)
+    try:
+        orchestra.register(lv1)
+    except Exception as e:
+        logger.warning("Could not auto-register lv1: %s — see adapter notes", e)
 
     logger.info("Orchestra registered with %d strategies", len(orchestra._strategies))
 
@@ -198,6 +243,16 @@ async def main() -> None:
         bot=bot,
         chat_id=chat_id,
         orchestra=orchestra,
+    )
+
+    # LV1 cycle (Phase 6.1) — dormant until market_state_provider wired (Phase 6.2)
+    scheduler.add_job(
+        lv1.run_one_cycle,
+        trigger="interval",
+        seconds=30,
+        id="lv1_cycle",
+        max_instances=1,
+        misfire_grace_time=10,
     )
 
     # ---- 11. Run all background tasks ----
@@ -255,6 +310,14 @@ async def main() -> None:
     except Exception:
         pass
     scheduler.shutdown(wait=False)
+
+    # Phase 6.2 — stop market provider (cancels WS tasks, closes ccxt.pro client)
+    if market_provider is not None:
+        try:
+            await market_provider.stop()
+            logger.info("MarketStateProvider stopped cleanly")
+        except Exception as e:
+            logger.warning("MarketStateProvider shutdown error: %s", e)
 
     for task in tasks:
         task.cancel()
