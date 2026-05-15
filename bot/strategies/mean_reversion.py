@@ -43,6 +43,9 @@ from bot.strategies.base_strategy import (
     StrategyConfig,
     StrategyStatus,
 )
+import logging
+
+log = logging.getLogger("qa_bot.strategies.mean_reversion")
 
 
 # ---- Tunable parameters (LOCKED by walk-forward validation; do not change ad-hoc) ----
@@ -126,6 +129,7 @@ class MeanReversionStrategy(BaseStrategy):
         regime: str,
         now: Optional[datetime] = None,
     ) -> Signal:
+        log.info("[EVAL_TICK] strategy=mean_reversion_v1 cycle_start")
         """
         Evaluate one symbol. Returns Signal which is then risk-gated by base class.
 

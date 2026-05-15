@@ -461,6 +461,17 @@ class EarnManager:
         """True if this product type can be auto-subscribed via API."""
         return product_type in cls.AUTOMATABLE_PRODUCTS
 
+    async def check_apr_and_alert(self, bot, chat_id) -> None:
+        """Phase 7.3 stub — APR drift alerting not yet implemented.
+
+        Caller in bot/scheduler.py:154 expects this method. Returning
+        no-op silences AttributeError noise (~4/day). Real implementation
+        deferred to Phase 7.5+: should compare current blended APR
+        (from get_summary()) against historical baseline and alert via
+        `bot.send_message(chat_id, ...)` on drift > threshold.
+        """
+        return None
+
 
 # =============================================================================
 # CLI / TEST

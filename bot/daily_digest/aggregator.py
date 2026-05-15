@@ -172,7 +172,7 @@ _SEVERITY_RES = {
 _OTHER_PATTERNS: Dict[str, re.Pattern] = {
     "trades_opened":      re.compile(r"\b(trade opened|order filled|position opened|opened position)\b", re.I),
     "trades_closed":      re.compile(r"\b(trade closed|position closed|closed position|exit filled)\b", re.I),
-    "scheduler_runs":     re.compile(r"\b(scheduler|cron)\b.*\b(fired|completed)\b", re.I),
+    "scheduler_runs":     re.compile(r"apscheduler.*Running job", re.I),
     "telegram_reconnects": re.compile(r"\bServerDisconnectedError\b|\b(telegram).*reconnect", re.I),
     "dxy_missing":        re.compile(r"\bDX-Y\.NYB\b|\bDXY\b.*\b(missing|unavailable|fail)", re.I),
     "vix_missing":        re.compile(r"\b\^?VIX\b.*\b(missing|unavailable|fail)", re.I),
