@@ -144,13 +144,20 @@ class RiskKernel:
     """
     Production risk control. All trades pass through approve_trade().
     State persisted to JSON for crash recovery.
+
+    Phase 6.3.1 — accepts optional `clock` injection for backtest replay.
+    Default (None) uses wall clock — production behavior bit-identical.
     """
 
     def __init__(
         self,
         starting_equity_usd: float,
         state_file_path:     Optional[Path] = None,
+        clock:               Optional[object] = None,
     ):
+        # Clock injection (default: wall clock — production behavior)
+        self._clock = clock  # has .now() -> datetime if injected; else use time.time() etc.
+
         self.starting_equity = starting_equity_usd
         self.current_equity  = starting_equity_usd
         self.peak_equity     = starting_equity_usd
@@ -176,6 +183,22 @@ class RiskKernel:
             f"daily_dd_limit={DAILY_DD_LIMIT_PCT*100:.0f}% "
             f"weekly_dd_limit={WEEKLY_DD_LIMIT_PCT*100:.0f}%"
         )
+
+    # ─── Clock helpers ──────────────────────────────────────────────────────
+    # When clock is None: production wall-clock behavior (time.time(), datetime.now()).
+    # When clock injected: backtest replay uses injected datetime.
+
+    def _now_ts(self) -> float:
+        """Current Unix timestamp. Production: time.time(). Backtest: clock.now().timestamp()."""
+        if self._clock is not None:
+            return self._clock.now().timestamp()
+        return time.time()
+
+    def _now_dt(self) -> datetime:
+        """Current datetime UTC. Production: datetime.now(utc). Backtest: clock.now()."""
+        if self._clock is not None:
+            return self._clock.now()
+        return datetime.now(timezone.utc)
 
     # ── PUBLIC API: TRADE APPROVAL ──────────────────────────────────────────────
 
@@ -333,7 +356,7 @@ class RiskKernel:
         """User-triggered halt."""
         self._halted        = True
         self._halt_reason   = HaltReason.MANUAL
-        self._halt_until_ts = time.time() + (hours * 3600)
+        self._halt_until_ts = self._now_ts() + (hours * 3600)
         log.warning(f"MANUAL HALT activated: {reason} ({hours}h)")
         self._save_state()
 
@@ -445,7 +468,7 @@ class RiskKernel:
     def _check_killswitch_active(self) -> tuple[bool, HaltReason]:
         """Returns (active=True if trading allowed, halt_reason)."""
         if self._halted:
-            if self._halt_until_ts > 0 and time.time() >= self._halt_until_ts:
+            if self._halt_until_ts > 0 and self._now_ts() >= self._halt_until_ts:
                 # Auto-resume after timed halt expires
                 log.info(f"Halt expired, auto-resuming (was: {self._halt_reason.value})")
                 self._halted        = False
@@ -487,7 +510,7 @@ class RiskKernel:
     def _trigger_halt(self, reason: HaltReason, hours: float):
         self._halted        = True
         self._halt_reason   = reason
-        self._halt_until_ts = time.time() + (hours * 3600)
+        self._halt_until_ts = self._now_ts() + (hours * 3600)
         log.error(
             f"🚨 KILLSWITCH TRIGGERED: {reason.value} "
             f"(halt {hours:.0f}h) "
@@ -496,25 +519,27 @@ class RiskKernel:
         )
 
     def _maybe_reset_periods(self):
-        now = time.time()
+        now = self._now_ts()
         if now >= self._daily_reset_ts:
             log.info(f"Daily reset: pnl was ${self._daily_pnl:+.2f}")
             self._daily_pnl       = 0.0
-            self._daily_reset_ts  = self._next_utc_midnight_ts()
+            self._daily_reset_ts  = self._next_utc_midnight_ts(self._now_dt())
         if now >= self._weekly_reset_ts:
             log.info(f"Weekly reset: pnl was ${self._weekly_pnl:+.2f}")
             self._weekly_pnl      = 0.0
-            self._weekly_reset_ts = self._next_utc_monday_ts()
+            self._weekly_reset_ts = self._next_utc_monday_ts(self._now_dt())
 
     @staticmethod
-    def _next_utc_midnight_ts() -> float:
-        now = datetime.now(timezone.utc)
+    def _next_utc_midnight_ts(now: Optional[datetime] = None) -> float:
+        if now is None:
+            now = datetime.now(timezone.utc)
         tomorrow = now.replace(hour=0, minute=0, second=0, microsecond=0)
         return tomorrow.timestamp() + 86400
 
     @staticmethod
-    def _next_utc_monday_ts() -> float:
-        now = datetime.now(timezone.utc)
+    def _next_utc_monday_ts(now: Optional[datetime] = None) -> float:
+        if now is None:
+            now = datetime.now(timezone.utc)
         days_until_monday = (7 - now.weekday()) % 7
         if days_until_monday == 0:
             days_until_monday = 7

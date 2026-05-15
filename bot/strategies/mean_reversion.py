@@ -124,6 +124,7 @@ class MeanReversionStrategy(BaseStrategy):
         symbol: str,
         market_data: Dict[str, Any],
         regime: str,
+        now: Optional[datetime] = None,
     ) -> Signal:
         """
         Evaluate one symbol. Returns Signal which is then risk-gated by base class.
@@ -133,6 +134,9 @@ class MeanReversionStrategy(BaseStrategy):
             - returns_1h: latest 1h return as float (e.g. -0.052 for -5.2%)
             - rsi_14_1h: latest RSI(14) on 1h candles
             - last_price: current spot price
+
+        Phase 6.3.1 — `now` parameter accepts injected clock from backtest replay.
+        Default (None) preserves production wall-clock behavior bit-identical.
         """
         if symbol not in self._universe:
             return self._hold(symbol, "symbol_not_in_universe")
@@ -148,7 +152,7 @@ class MeanReversionStrategy(BaseStrategy):
 
         # If we already have a position — check exit / scale-in
         if symbol in self._positions:
-            return self._evaluate_existing_position(symbol, last_price, rsi, market_data)
+            return self._evaluate_existing_position(symbol, last_price, rsi, market_data, now=now)
 
         # No position — check entry trigger
         return self._evaluate_entry(symbol, ret_1h, rsi, last_price, regime)
@@ -212,11 +216,14 @@ class MeanReversionStrategy(BaseStrategy):
         last_price: float,
         rsi: float,
         market_data: Dict[str, Any],
+        now: Optional[datetime] = None,
     ) -> Signal:
         pos = self._positions[symbol]
         drawdown_from_avg = (last_price - pos.avg_entry_price) / pos.avg_entry_price
         unrealized_pct = drawdown_from_avg
-        age_hours = (datetime.now(timezone.utc) - pos.opened_at).total_seconds() / 3600
+        if now is None:
+            now = datetime.now(timezone.utc)
+        age_hours = (now - pos.opened_at).total_seconds() / 3600
 
         # ---- exit conditions (priority order) ----
 
@@ -315,9 +322,11 @@ class MeanReversionStrategy(BaseStrategy):
         tier: int,
         fill_price: float,
         fill_size_usd: float,
+        now: Optional[datetime] = None,
     ) -> None:
         """Update internal position state after a tier is filled."""
-        now = datetime.now(timezone.utc)
+        if now is None:
+            now = datetime.now(timezone.utc)
         if symbol not in self._positions:
             self._positions[symbol] = MeanReversionPosition(
                 symbol=symbol,
@@ -327,7 +336,7 @@ class MeanReversionStrategy(BaseStrategy):
                 opened_at=now,
                 last_tier_added_at=now,
             )
-            self.on_position_opened(symbol, "long", fill_size_usd, fill_price)
+            self.on_position_opened(symbol, "long", fill_size_usd, fill_price, now=now)
         else:
             pos = self._positions[symbol]
             new_total_size = pos.total_size_usd + fill_size_usd
@@ -340,8 +349,14 @@ class MeanReversionStrategy(BaseStrategy):
             pos.tier = tier
             pos.last_tier_added_at = now
 
-    def on_position_closed(self, symbol: str, pnl_usd: float, was_loss: bool) -> None:
-        super().on_position_closed(symbol, pnl_usd, was_loss)
+    def on_position_closed(
+        self,
+        symbol: str,
+        pnl_usd: float,
+        was_loss: bool,
+        now: Optional[datetime] = None,
+    ) -> None:
+        super().on_position_closed(symbol, pnl_usd, was_loss, now=now)
         self._positions.pop(symbol, None)
 
         if was_loss:

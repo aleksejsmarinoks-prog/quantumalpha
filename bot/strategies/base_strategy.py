@@ -166,10 +166,18 @@ class BaseStrategy(ABC):
         ...
 
     # ---- shared risk gates ----
-    def apply_risk_gates(self, signal: Signal, regime: str) -> Signal:
+    def apply_risk_gates(
+        self,
+        signal: Signal,
+        regime: str,
+        now: Optional[datetime] = None,
+    ) -> Signal:
         """
         Final risk gate. Downgrades unsafe signals to HOLD.
         Returns the (possibly downgraded) signal.
+
+        Phase 6.3.1 — `now` parameter accepts injected clock from backtest replay.
+        Default (None) preserves production wall-clock behavior bit-identical.
         """
         if not signal.is_actionable():
             return signal
@@ -187,7 +195,7 @@ class BaseStrategy(ABC):
             return self._downgrade(signal, "bearish_regime_block")
 
         # Gate 3: daily loss limit
-        self._reset_daily_pnl_if_new_day()
+        self._reset_daily_pnl_if_new_day(now=now)
         capital = self._estimated_capital()
         if (
             capital > 0
@@ -196,7 +204,8 @@ class BaseStrategy(ABC):
             return self._downgrade(signal, "daily_loss_limit_hit")
 
         # Gate 4: global cooldown
-        now = datetime.now(timezone.utc)
+        if now is None:
+            now = datetime.now(timezone.utc)
         if self._cooldown_until and now < self._cooldown_until:
             return self._downgrade(signal, "global_cooldown")
 
@@ -228,30 +237,47 @@ class BaseStrategy(ABC):
         )
 
     # ---- state management ----
-    def on_position_opened(self, symbol: str, side: str, size_usd: float, entry_price: float) -> None:
+    def on_position_opened(
+        self,
+        symbol: str,
+        side: str,
+        size_usd: float,
+        entry_price: float,
+        now: Optional[datetime] = None,
+    ) -> None:
+        if now is None:
+            now = datetime.now(timezone.utc)
         self._active_positions[symbol] = {
             "side": side,
             "size_usd": size_usd,
             "entry_price": entry_price,
-            "opened_at": datetime.now(timezone.utc),
+            "opened_at": now,
             "tier": 1,
         }
 
-    def on_position_closed(self, symbol: str, pnl_usd: float, was_loss: bool) -> None:
+    def on_position_closed(
+        self,
+        symbol: str,
+        pnl_usd: float,
+        was_loss: bool,
+        now: Optional[datetime] = None,
+    ) -> None:
         """Update cooldowns and pnl tracking after a position closes."""
-        self._reset_daily_pnl_if_new_day()
+        self._reset_daily_pnl_if_new_day(now=now)
         self._daily_pnl_usd += pnl_usd
         self._active_positions.pop(symbol, None)
 
         if was_loss:
-            now = datetime.now(timezone.utc)
+            if now is None:
+                now = datetime.now(timezone.utc)
             self._cooldown_until = now + timedelta(hours=self.config.cooldown_after_loss_hours)
             self._symbol_cooldown_until[symbol] = now + timedelta(
                 hours=self.config.cooldown_per_symbol_hours
             )
 
-    def _reset_daily_pnl_if_new_day(self) -> None:
-        now = datetime.now(timezone.utc)
+    def _reset_daily_pnl_if_new_day(self, now: Optional[datetime] = None) -> None:
+        if now is None:
+            now = datetime.now(timezone.utc)
         if (
             self._daily_pnl_reset_date is None
             or now.date() != self._daily_pnl_reset_date.date()

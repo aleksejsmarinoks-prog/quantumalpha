@@ -352,10 +352,16 @@ class FundingArbStrategy:
         return True, ["All checks passed"]
 
     def should_close(
-        self, arb: ArbPosition, current_funding_rate: float
+        self,
+        arb: ArbPosition,
+        current_funding_rate: float,
+        now: Optional[datetime] = None,
     ) -> tuple[bool, list[str]]:
         """
         Decision: should we close an open arb position?
+
+        Phase 6.3.1 — `now` parameter accepts injected clock from backtest replay.
+        Default (None) preserves production wall-clock behavior bit-identical.
         """
         reasons = []
 
@@ -368,7 +374,9 @@ class FundingArbStrategy:
             opened_ts = datetime.fromisoformat(
                 arb.opened_at_utc.replace("Z", "+00:00")
             ).timestamp()
-            hours_open = (datetime.now(timezone.utc).timestamp() - opened_ts) / 3600
+            if now is None:
+                now = datetime.now(timezone.utc)
+            hours_open = (now.timestamp() - opened_ts) / 3600
 
         if hours_open < MIN_HOLD_HOURS:
             return False, [f"Min hold {MIN_HOLD_HOURS}h not met ({hours_open:.1f}h)"]
@@ -409,11 +417,15 @@ class FundingArbStrategy:
         client:     BybitClient,
         symbol:     str,
         funding:    FundingRate,
+        now: Optional[datetime] = None,
     ) -> Optional[ArbPosition]:
         """
         Open a new delta-neutral position.
         Paper mode: simulates fills using current ticker prices.
         Live mode: NOT YET IMPLEMENTED — requires API keys + Task #8 verify.
+
+        Phase 6.3.1 — `now` parameter accepts injected clock from backtest replay.
+        Default (None) preserves production wall-clock behavior bit-identical.
         """
         # Risk Kernel pre-approval
         request = TradeRequest(
@@ -454,6 +466,8 @@ class FundingArbStrategy:
         spot_qty = approved_size / spot_ticker.last_price
         perp_qty = approved_size / perp_ticker.last_price
 
+        if now is None:
+            now = datetime.now(timezone.utc)
         arb = ArbPosition(
             arb_id=str(uuid.uuid4())[:8],
             symbol_perp=symbol,
@@ -465,7 +479,7 @@ class FundingArbStrategy:
             entry_funding_rate=funding.funding_rate,
             entry_perp_price=perp_ticker.last_price,
             entry_spot_price=spot_ticker.last_price,
-            opened_at_utc=datetime.now(timezone.utc).isoformat(),
+            opened_at_utc=now.isoformat(),
             is_paper=not self.live_trading,
         )
 
@@ -520,8 +534,13 @@ class FundingArbStrategy:
         client:        BybitClient,
         arb:           ArbPosition,
         current_funding: float,
+        now: Optional[datetime] = None,
     ) -> bool:
-        """Close both legs of an arb position."""
+        """Close both legs of an arb position.
+
+        Phase 6.3.1 — `now` parameter accepts injected clock from backtest replay.
+        Default (None) preserves production wall-clock behavior bit-identical.
+        """
         if arb.state != ArbPositionState.OPEN:
             log.warning(f"Cannot close arb {arb.arb_id}: state={arb.state.value}")
             return False
@@ -533,11 +552,13 @@ class FundingArbStrategy:
             log.error(f"Close fetch failed for {arb.arb_id}: {e}")
             return False
 
+        if now is None:
+            now = datetime.now(timezone.utc)
         arb.state              = ArbPositionState.CLOSING
         arb.exit_funding_rate  = current_funding
         arb.exit_perp_price    = perp_ticker.last_price
         arb.exit_spot_price    = spot_ticker.last_price
-        arb.closed_at_utc      = datetime.now(timezone.utc).isoformat()
+        arb.closed_at_utc      = now.isoformat()
 
         # Spot exit notional + fees
         spot_exit_notional = arb.spot_quantity * spot_ticker.last_price

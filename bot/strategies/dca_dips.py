@@ -154,6 +154,7 @@ class DCADipsStrategy(BaseStrategy):
         symbol: str,
         market_data: Dict[str, Any],
         regime: str,
+        now: Optional[datetime] = None,
     ) -> Signal:
         """
         For DCA strategy, evaluate() handles:
@@ -162,6 +163,9 @@ class DCADipsStrategy(BaseStrategy):
 
         Event ENTRY is triggered via trigger_event() from outside, not from
         evaluate() directly. This is by design — macro events are external signals.
+
+        Phase 6.3.1 — `now` parameter accepts injected clock from backtest replay.
+        Default (None) preserves production wall-clock behavior bit-identical.
         """
         if symbol not in self._universe:
             return self._hold(symbol, "symbol_not_in_universe")
@@ -171,13 +175,16 @@ class DCADipsStrategy(BaseStrategy):
 
         last_price = float(market_data["last_price"])
 
+        # Resolve now once for entire evaluation
+        if now is None:
+            now = datetime.now(timezone.utc)
+
         # First — check if any active event has a tranche that should fire NOW
         for event_id, dca_event in list(self._active_events.items()):
             if dca_event.closed:
                 continue
 
             tranches = dca_event.tranches_per_symbol.get(symbol, [])
-            now = datetime.now(timezone.utc)
 
             for tranche in tranches:
                 if tranche.fired:
@@ -195,7 +202,7 @@ class DCADipsStrategy(BaseStrategy):
         for event_id, dca_event in list(self._active_events.items()):
             if dca_event.closed:
                 continue
-            exit_sig = self._check_exit(symbol, dca_event, last_price)
+            exit_sig = self._check_exit(symbol, dca_event, last_price, now=now)
             if exit_sig is not None:
                 return exit_sig
 
@@ -239,6 +246,7 @@ class DCADipsStrategy(BaseStrategy):
         symbol: str,
         dca_event: DCAEvent,
         last_price: float,
+        now: Optional[datetime] = None,
     ) -> Optional[Signal]:
         """Compute event-level PnL and check stops."""
         tranches = dca_event.tranches_per_symbol.get(symbol, [])
@@ -294,8 +302,10 @@ class DCADipsStrategy(BaseStrategy):
             )
 
         # Time stop — 30 days max
+        if now is None:
+            now = datetime.now(timezone.utc)
         first_fill = min(filled, key=lambda t: t.target_time)
-        if (datetime.now(timezone.utc) - first_fill.target_time) > timedelta(
+        if (now - first_fill.target_time) > timedelta(
             days=MAX_HOLD_DAYS_PER_EVENT
         ):
             return Signal(
@@ -324,7 +334,11 @@ class DCADipsStrategy(BaseStrategy):
         )
 
     # ---- external event triggering ----
-    def trigger_event(self, event: MacroEvent) -> bool:
+    def trigger_event(
+        self,
+        event: MacroEvent,
+        now: Optional[datetime] = None,
+    ) -> bool:
         """
         Called by macro_events module when a new macro event fires.
         Returns True if event was scheduled, False if rejected.
@@ -334,6 +348,9 @@ class DCADipsStrategy(BaseStrategy):
         - Same event type fired within last 7 days (clustering protection)
         - Event not corroborated (for GEOPOLITICAL_CRITICAL)
         - Strategy disabled or in cooldown
+
+        Phase 6.3.1 — `now` parameter accepts injected clock from backtest replay.
+        Default (None) preserves production wall-clock behavior bit-identical.
         """
         if self.status in (StrategyStatus.DISABLED, StrategyStatus.HALTED):
             return False
@@ -350,14 +367,17 @@ class DCADipsStrategy(BaseStrategy):
         if active_count >= MAX_CONCURRENT_EVENTS:
             return False
 
+        # Resolve now once for the rest
+        if now is None:
+            now = datetime.now(timezone.utc)
+
         # Check inter-event gap (7-day rule)
         if self._last_event_close_at is not None:
-            gap = datetime.now(timezone.utc) - self._last_event_close_at
+            gap = now - self._last_event_close_at
             if gap < timedelta(days=MIN_EVENT_GAP_DAYS):
                 return False
 
         # Build tranche schedule
-        now = datetime.now(timezone.utc)
         event_capital = self._strategy_capital_usd * 0.5    # 50% per event max
         if event_capital < 50:
             return False  # too small to be meaningful
@@ -408,6 +428,7 @@ class DCADipsStrategy(BaseStrategy):
         event_id: str,
         realized_pnl_usd: float,
         reason: str,
+        now: Optional[datetime] = None,
     ) -> None:
         if event_id not in self._active_events:
             return
@@ -418,7 +439,9 @@ class DCADipsStrategy(BaseStrategy):
 
         self._event_history.append(dca_event)
         self._active_events.pop(event_id, None)
-        self._last_event_close_at = datetime.now(timezone.utc)
+        if now is None:
+            now = datetime.now(timezone.utc)
+        self._last_event_close_at = now
 
     # ---- introspection ----
     def get_active_events(self) -> Dict[str, Any]:
