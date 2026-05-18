@@ -72,6 +72,10 @@ def build_scheduler(
 
     # Job 2: hourly equity snapshot
     async def _equity_snapshot():
+        # Phase 7.4: BYBIT keys guard — skip when paper/dev mode
+        if not os.getenv("BYBIT_API_KEY") or not os.getenv("BYBIT_API_SECRET"):
+            logger.debug("Skipping _equity_snapshot: BYBIT keys not configured (paper mode)")
+            return
         try:
             balance = await bybit_client.get_unified_balance()
             risk_kernel.record_equity_snapshot(balance.get("totalEquity", 0))
@@ -185,6 +189,10 @@ def build_scheduler(
 
         # Job 7: portfolio value sync every 10 min (more frequent than equity snapshot)
         async def _portfolio_sync():
+            # Phase 7.4: BYBIT keys guard — skip when paper/dev mode
+            if not os.getenv("BYBIT_API_KEY") or not os.getenv("BYBIT_API_SECRET"):
+                logger.debug("Skipping _portfolio_sync: BYBIT keys not configured (paper mode)")
+                return
             try:
                 balance = await bybit_client.get_unified_balance()
                 orchestra.update_portfolio_value(float(balance.get("totalEquity", 0)))

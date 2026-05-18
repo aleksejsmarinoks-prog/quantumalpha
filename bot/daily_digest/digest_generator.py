@@ -64,7 +64,7 @@ CONTEXT FLAGS (interpret data with these rules — DO NOT include the rules in o
 - Telegram ServerDisconnectedError — only flag if telegram_reconnects > 5
 - Strategy eval counts come from STRICT [EVAL_TICK] markers (Phase 7.2).
   Expected steady-state rates: liquidity_vortex_v1 ~2880/24h, funding_arb_v1 ~96/24h,
-  mean_reversion_v1 ~288/24h. Significant deviation (>20%) is worth flagging.
+  mean_reversion_v1 ~700/24h (evaluates ETH+SOL = 2 symbols per Orchestra tick). Significant deviation (>20%) is worth flagging.
 - Error volume: flag only if (errors + warnings) > 50 OR severity_counts.CRITICAL > 0.
   Otherwise label as "normal operation".
 
